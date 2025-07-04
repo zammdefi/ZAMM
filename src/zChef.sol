@@ -31,7 +31,7 @@ abstract contract ERC6909Lite {
 
 /// ─────────────────────────────── zChef Singleton ────────────────────────────────
 /// @notice Minimalist ERC-6909 LP incentives staking rewards contract. A faster MasterChef.
-/// @dev Streams are immutable; sub-wei rounding remainder stays permanently in the contract.
+/// @dev Streams are immutable; dusty rounding remainder stays permanently in the contract.
 contract zChef is ERC6909Lite {
     /* ───────────────────────────── Events ───────────────────────────── */
     event Sweep(uint256 indexed chefId, uint256 amount);
@@ -102,7 +102,7 @@ contract zChef is ERC6909Lite {
         uint256 rewardId,
         uint256 amount,
         uint64 duration,
-        bytes32 salt // uniqueness and/or vanity mining
+        bytes32 // uniqueness and/or vanity mining
     ) public lock returns (uint256 chefId) {
         require(amount != 0, ZeroAmount());
         require(duration != 0, InvalidDuration());
@@ -319,6 +319,78 @@ contract zChef is ERC6909Lite {
         if (id != 0) require(IERC6909(token).transfer(to, id, amt), TransferFailed());
         else safeTransfer(token, to, amt);
     }
+
+    /* ───────────────────────────── ETH LP ZAP ───────────────────────────── */
+
+    error InvalidPoolKey();
+    error SwapExactInFail();
+    error AddLiquidityFail();
+
+    /// @dev ETH LP zap for ZAMM-like `lpSrc`.
+    function zapDeposit(
+        address lpSrc, // e.g., ZAMM
+        uint256 chefId, // incentives
+        PoolKey memory poolKey,
+        uint256 amountOutMin,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        uint256 deadline
+    ) public payable lock returns (uint256 amount0, uint256 amount1, uint256 liquidity) {
+        unchecked {
+            require(poolKey.token0 == address(0), InvalidPoolKey());
+
+            assembly ("memory-safe") {
+                pop(call(gas(), lpSrc, callvalue(), codesize(), 0x00, codesize(), 0x00))
+            }
+
+            amount0 = msg.value / 2;
+
+            if (lpSrc == ZAMM_0) poolKey.feeOrHook = uint256(uint96(poolKey.feeOrHook));
+
+            // 1) swapExactIn
+            {
+                bytes4 sel = lpSrc == ZAMM_0 ? bytes4(0x7466fde7) : bytes4(0x3c5eec50);
+                bytes memory callData = abi.encodeWithSelector(
+                    sel, poolKey, amount0, amountOutMin, true, lpSrc, deadline
+                );
+                (bool ok, bytes memory ret) = lpSrc.call(callData);
+                require(ok, SwapExactInFail());
+                amount1 = abi.decode(ret, (uint256));
+            }
+
+            // 2) addLiquidity
+            {
+                bytes4 sel = lpSrc == ZAMM_0 ? bytes4(0x48416da8) : bytes4(0xc42957a8);
+                bytes memory callData = abi.encodeWithSelector(
+                    sel, poolKey, amount0, amount1, amount0Min, amount1Min, address(this), deadline
+                );
+                (bool ok, bytes memory ret) = lpSrc.call(callData);
+                require(ok, AddLiquidityFail());
+                (amount0, amount1, liquidity) = abi.decode(ret, (uint256, uint256, uint256));
+            }
+
+            // refund any excess
+            IZAMM(lpSrc).recoverTransientBalance(address(0), 0, msg.sender);
+            IZAMM(lpSrc).recoverTransientBalance(poolKey.token1, poolKey.id1, msg.sender);
+        }
+
+        Pool storage p = _updatePool(chefId);
+
+        if (block.timestamp >= p.end) revert StreamEnded();
+
+        uint128 shares = uint128(liquidity);
+
+        // explicit uint256 cast avoids pre-overflow and guarantees custom error
+        require(uint256(p.totalShares) + shares <= type(uint128).max, Overflow());
+        p.totalShares += shares;
+
+        _mint(msg.sender, chefId, shares);
+
+        /* ── update user debt ── */
+        userDebt[chefId][msg.sender] += uint256(shares) * p.accRewardPerShare / ACC_PRECISION;
+
+        emit Deposit(msg.sender, chefId, liquidity);
+    }
 }
 
 // Modified from Solady (https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol)
@@ -358,4 +430,42 @@ function safeTransferFrom(address token, address from, address to, uint256 amoun
         mstore(0x60, 0)
         mstore(0x40, m)
     }
+}
+
+// ZAMM-like LP zap extension
+// see, 0x000000000000040470635EB91b7CE4D132D616eD
+
+address constant ZAMM_0 = 0x00000000000008882D72EfA6cCE4B6a40b24C860;
+
+struct PoolKey {
+    uint256 id0;
+    uint256 id1;
+    address token0;
+    address token1;
+    uint256 feeOrHook; // bps-fee OR flags|address
+}
+
+interface IZAMM {
+    function addLiquidity(
+        PoolKey calldata poolKey,
+        uint256 amount0Desired,
+        uint256 amount1Desired,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256 amount0, uint256 amount1, uint256 liquidity);
+
+    function swapExactIn(
+        PoolKey calldata poolKey,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        bool zeroForOne,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256 amountOut);
+
+    function recoverTransientBalance(address token, uint256 id, address to)
+        external
+        returns (uint256 amount);
 }

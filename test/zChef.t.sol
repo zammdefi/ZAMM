@@ -2,7 +2,7 @@
 pragma solidity ^0.8.30;
 
 import "forge-std/Test.sol";
-import {zChef} from "../src/zChef.sol";
+import {PoolKey, zChef} from "../src/zChef.sol";
 
 /// ─────────────────────────────────────────────────────────────────────────
 /// Minimal interface fragments we need from the on-chain singletons
@@ -46,7 +46,13 @@ contract zChefTest is Test {
         /* 2. create a reward stream: 1 000 tokens over 1 000 s */
         vm.prank(USER);
         chefId = chef.createStream(
-            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 1_000 ether, 1_000, bytes32(0)
+            LP_TOKEN,
+            LP_ID,
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            1_000 ether,
+            1_000,
+            bytes32(keccak256(abi.encode(1)))
         );
     }
 
@@ -176,7 +182,13 @@ contract zChefTest is Test {
         vm.prank(USER);
         vm.expectRevert(zChef.Exists.selector);
         chef.createStream(
-            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 1000 ether, 1000, bytes32(0)
+            LP_TOKEN,
+            LP_ID,
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            1000 ether,
+            1000,
+            bytes32(keccak256(abi.encode(1)))
         );
     }
 
@@ -333,7 +345,13 @@ contract zChefTest is Test {
         vm.prank(USER);
         vm.expectRevert(zChef.Exists.selector);
         chef.createStream(
-            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 1_000 ether, 1_000, bytes32(0)
+            LP_TOKEN,
+            LP_ID,
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            1_000 ether,
+            1_000,
+            bytes32(keccak256(abi.encode(1)))
         );
     }
 
@@ -486,6 +504,93 @@ contract zChefTest is Test {
         vm.prank(USER);
         vm.expectRevert(zChef.ZeroAmount.selector);
         chef.deposit(chefId, 0);
+    }
+
+    /* ======================================================================
+       26. Zap‐deposit 1 ETH into the chef via ZAMM_0
+    ====================================================================== */
+
+    function testZapDepositETHIntoChef() public {
+        // give USER some ETH
+        vm.deal(USER, 1 ether);
+
+        // build the ETH⇄LP pool key: token0 = ETH id0 = 0; token1 = incentive token / id1 = INCENTIVE_ID; 1% fee
+        PoolKey memory pk = PoolKey({
+            id0: 0,
+            id1: INCENTIVE_ID,
+            token0: address(0),
+            token1: INCENTIVE_TOKEN,
+            feeOrHook: 100
+        });
+
+        // do the zap: split 1 ETH, swap half for incentive token in ZAMM, mint LP, then deposit into chef
+        vm.prank(USER);
+        (,, uint256 liquidity) = chef.zapDeposit{value: 1 ether}(
+            LP_TOKEN, // ZAMM (nohook)
+            chefId,
+            pk,
+            /* amountOutMin */
+            0,
+            /* amount0Min   */
+            0,
+            /* amount1Min   */
+            0,
+            /* deadline     */
+            block.timestamp + 1
+        );
+
+        // assert we actually got some LP liquidity and chef shares
+        assertGt(liquidity, 0, "no liquidity minted");
+        assertEq(chef.balanceOf(USER, chefId), liquidity, "chef shares != liquidity");
+        // chef should now hold exactly that many LP tokens of id LP_ID
+        assertEq(
+            IERC6909Core(LP_TOKEN).balanceOf(address(chef), LP_ID),
+            liquidity,
+            "chef LP balance mismatch"
+        );
+    }
+
+    /* ======================================================================
+       26. Zap‐deposit 1 ETH into the chef via ZAMM_1
+    ====================================================================== */
+
+    function testZapDepositETHIntoChefDiffZamm() public {
+        address LP = 0x000000000000040470635EB91b7CE4D132D616eD;
+        uint256 ID = 3866052644274159259257513057556902007700018844572780589640963787229397380392;
+
+        vm.prank(USER);
+        uint256 cId =
+            chef.createStream(LP, ID, INCENTIVE_TOKEN, INCENTIVE_ID, 1_000 ether, 1_000, bytes32(0));
+
+        // give USER some ETH
+        vm.deal(USER, 1 ether);
+
+        PoolKey memory pk =
+            PoolKey({id0: 0, id1: 4, token0: address(0), token1: LP, feeOrHook: 100});
+
+        // do the zap: split 1 ETH, swap half for incentive token in ZAMM, mint LP, then deposit into chef
+        vm.prank(USER);
+        (,, uint256 liquidity) = chef.zapDeposit{value: 1 ether}(
+            LP, // ZAMM (hook)
+            cId,
+            pk,
+            /* amountOutMin */
+            0,
+            /* amount0Min   */
+            0,
+            /* amount1Min   */
+            0,
+            /* deadline     */
+            block.timestamp + 1
+        );
+
+        // assert we actually got some LP liquidity and chef shares
+        assertGt(liquidity, 0, "no liquidity minted");
+        assertEq(chef.balanceOf(USER, cId), liquidity, "chef shares != liquidity");
+        // chef should now hold exactly that many LP tokens of id LP_ID
+        assertEq(
+            IERC6909Core(LP).balanceOf(address(chef), ID), liquidity, "chef LP balance mismatch"
+        );
     }
 }
 
