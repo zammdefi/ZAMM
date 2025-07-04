@@ -394,7 +394,6 @@ contract zChef is ERC6909Lite {
 }
 
 // Modified from Solady (https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol)
-
 function safeTransfer(address token, address to, uint256 amount) {
     assembly ("memory-safe") {
         mstore(0x14, to)

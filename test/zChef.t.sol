@@ -592,6 +592,34 @@ contract zChefTest is Test {
             IERC6909Core(LP).balanceOf(address(chef), ID), liquidity, "chef LP balance mismatch"
         );
     }
+
+    /* ======================================================================
+       27. zapDeposit reverts on invalid poolKey.token0
+    ====================================================================== */
+    function testZapDepositInvalidPoolKeyReverts() public {
+        // fund USER with 1 ETH
+        vm.deal(USER, 1 ether);
+
+        // token0 must be address(0) for ETH-zap; here we set it non-zero to trigger revert
+        PoolKey memory badKey =
+            PoolKey({id0: 0, id1: LP_ID, token0: address(1), token1: LP_TOKEN, feeOrHook: 0});
+
+        vm.prank(USER);
+        vm.expectRevert(zChef.InvalidPoolKey.selector);
+        chef.zapDeposit{value: 1 ether}(
+            LP_TOKEN,
+            chefId,
+            badKey,
+            /* amountOutMin */
+            0,
+            /* amount0Min   */
+            0,
+            /* amount1Min   */
+            0,
+            /* deadline     */
+            block.timestamp + 1
+        );
+    }
 }
 
 /* ───────── Mini token that returns NO data ───────── */
