@@ -2,7 +2,7 @@
 pragma solidity ^0.8.30;
 
 /// ───────────────────────────── LP & Reward Interfaces ─────────────────────────────
-/// @notice Minimal multitoken interface.
+/// @notice Multitoken transfer interface.
 interface IERC6909 {
     function transfer(address, uint256, uint256) external returns (bool);
     function transferFrom(address, address, uint256, uint256) external returns (bool);
@@ -19,7 +19,9 @@ abstract contract ERC6909Lite {
     mapping(address => mapping(uint256 => uint256)) public balanceOf;
 
     function _mint(address receiver, uint256 id, uint256 amount) internal {
-        balanceOf[receiver][id] += amount;
+        unchecked {
+            balanceOf[receiver][id] += amount;
+        }
         emit Transfer(msg.sender, address(0), receiver, id, amount);
     }
 
@@ -30,8 +32,7 @@ abstract contract ERC6909Lite {
 }
 
 /// ─────────────────────────────── zChef Singleton ────────────────────────────────
-/// @notice Minimalist ERC-6909 LP incentives staking rewards contract. A faster MasterChef.
-/// @dev Streams are immutable; dusty rounding remainder stays permanently in the contract.
+/// @notice ERC-6909 LP incentives staking rewards. Minimalist Multitoken MasterChef.
 contract zChef is ERC6909Lite {
     /* ───────────────────────────── Events ───────────────────────────── */
     event Sweep(uint256 indexed chefId, uint256 amount);
@@ -63,8 +64,8 @@ contract zChef is ERC6909Lite {
     }
 
     mapping(uint256 chefId => Pool) public pools;
-    mapping(uint256 => address) public streamCreator;
-    mapping(uint256 chefId => mapping(address user => uint256 debt)) public userDebt;
+    mapping(uint256 chefId => address) public streamCreator;
+    mapping(uint256 chefId => mapping(address user => uint256)) public userDebt;
 
     constructor() payable {} // gas optimization
 
@@ -135,7 +136,6 @@ contract zChef is ERC6909Lite {
 
     /* ───────────────────────────── Deposit / Withdraw ───────────────────────────── */
     error StreamEnded();
-    error TransferFailed();
 
     function deposit(uint256 chefId, uint256 amount) public lock {
         require(amount != 0, ZeroAmount());
@@ -148,10 +148,10 @@ contract zChef is ERC6909Lite {
         /* ── pull LP & mint shares 1:1 ── */
         require(
             IERC6909(p.lpToken).transferFrom(msg.sender, address(this), p.lpId, amount),
-            TransferFailed()
+            TransferFromFailed()
         );
 
-        uint128 shares = uint128(amount);
+        uint128 shares = uint128(amount); // 1:1
 
         // explicit uint256 cast avoids pre-overflow and guarantees custom error
         require(uint256(p.totalShares) + shares <= type(uint128).max, Overflow());
@@ -165,7 +165,7 @@ contract zChef is ERC6909Lite {
         emit Deposit(msg.sender, chefId, amount);
     }
 
-    error InvalidAmount();
+    error TransferFailed();
 
     function withdraw(uint256 chefId, uint256 shares) public lock {
         require(shares != 0, ZeroAmount());
@@ -173,8 +173,6 @@ contract zChef is ERC6909Lite {
         Pool storage p = _updatePool(chefId);
 
         uint256 uShares = balanceOf[msg.sender][chefId];
-        require(shares <= uShares, InvalidAmount());
-
         /* pending */
         uint256 pending =
             uShares * p.accRewardPerShare / ACC_PRECISION - userDebt[chefId][msg.sender];
@@ -200,9 +198,10 @@ contract zChef is ERC6909Lite {
 
     /// @dev Pull rewards.
     function harvest(uint256 chefId) public lock {
-        Pool storage p = _updatePool(chefId);
         uint256 shares = balanceOf[msg.sender][chefId];
         if (shares == 0) revert NoStake();
+
+        Pool storage p = _updatePool(chefId);
 
         uint256 pending =
             shares * p.accRewardPerShare / ACC_PRECISION - userDebt[chefId][msg.sender];
@@ -214,9 +213,10 @@ contract zChef is ERC6909Lite {
 
     /// @dev Pull LP immediately, forfeit rewards.
     function emergencyWithdraw(uint256 chefId) public lock {
-        Pool storage p = pools[chefId];
         uint256 shares = balanceOf[msg.sender][chefId];
         require(shares != 0, NoStake());
+
+        Pool storage p = pools[chefId];
 
         _burn(msg.sender, chefId, shares);
         p.totalShares -= uint128(shares);
@@ -234,11 +234,12 @@ contract zChef is ERC6909Lite {
 
     /// @dev Reclaim undistributed rewards after the stream has ended.
     function sweepRemainder(uint256 chefId, address to) public lock {
+        if (msg.sender != streamCreator[chefId]) revert Unauthorized();
+
         Pool storage p = pools[chefId];
 
         if (block.timestamp <= p.end) revert StreamActive();
         if (p.totalShares != 0) revert StakeRemaining();
-        if (msg.sender != streamCreator[chefId]) revert Unauthorized();
 
         // seconds between last distribution and scheduled end
         uint64 dt = p.end > p.lastUpdate ? uint64(p.end - p.lastUpdate) : 0;
@@ -308,7 +309,8 @@ contract zChef is ERC6909Lite {
     function _transferIn(address token, uint256 id, uint256 amt) internal {
         if (id != 0) {
             require(
-                IERC6909(token).transferFrom(msg.sender, address(this), id, amt), TransferFailed()
+                IERC6909(token).transferFrom(msg.sender, address(this), id, amt),
+                TransferFromFailed()
             );
         } else {
             safeTransferFrom(token, msg.sender, address(this), amt);
@@ -378,7 +380,7 @@ contract zChef is ERC6909Lite {
 
         if (block.timestamp >= p.end) revert StreamEnded();
 
-        uint128 shares = uint128(liquidity);
+        uint128 shares = uint128(liquidity); // 1:1
 
         // explicit uint256 cast avoids pre-overflow and guarantees custom error
         require(uint256(p.totalShares) + shares <= type(uint128).max, Overflow());

@@ -205,7 +205,7 @@ contract zChefTest is Test {
         chef.deposit(chefId, 5);
 
         vm.prank(USER);
-        vm.expectRevert(zChef.InvalidAmount.selector);
+        vm.expectRevert();
         chef.withdraw(chefId, 10);
     }
 
@@ -596,6 +596,6 @@ contract zChefTest is Test {
 
 /* ───────── Mini token that returns NO data ───────── */
 contract StubERC20 {
-    function transferFrom(address, address, uint256) external {}
     function transfer(address, uint256) external {}
+    function transferFrom(address, address, uint256) external {}
 }
