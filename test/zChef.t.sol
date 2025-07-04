@@ -620,6 +620,54 @@ contract zChefTest is Test {
             block.timestamp + 1
         );
     }
+
+    /* ======================================================================
+       27. createStream with zero amount reverts ZeroAmount
+    ====================================================================== */
+    function testCreateStreamZeroAmountReverts() public {
+        vm.prank(USER);
+        vm.expectRevert(zChef.ZeroAmount.selector);
+        chef.createStream(
+            LP_TOKEN,
+            LP_ID,
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            0, // zero amount
+            1_000, // valid duration
+            bytes32(0)
+        );
+    }
+
+    /* ======================================================================
+       28. createStream with invalid durations reverts InvalidDuration
+    ====================================================================== */
+    function testCreateStreamInvalidDurationReverts() public {
+        // zero duration
+        vm.prank(USER);
+        vm.expectRevert(zChef.InvalidDuration.selector);
+        chef.createStream(
+            LP_TOKEN,
+            LP_ID,
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            1_000 ether,
+            0, // zero duration
+            bytes32(0)
+        );
+
+        // above max duration (> 730 days)
+        vm.prank(USER);
+        vm.expectRevert(zChef.InvalidDuration.selector);
+        chef.createStream(
+            LP_TOKEN,
+            LP_ID,
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            1_000 ether,
+            731 days, // exceeds 2-year limit
+            bytes32(0)
+        );
+    }
 }
 
 /* ───────── Mini token that returns NO data ───────── */

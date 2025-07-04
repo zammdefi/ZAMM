@@ -444,25 +444,6 @@ struct PoolKey {
 }
 
 interface IZAMM {
-    function addLiquidity(
-        PoolKey calldata poolKey,
-        uint256 amount0Desired,
-        uint256 amount1Desired,
-        uint256 amount0Min,
-        uint256 amount1Min,
-        address to,
-        uint256 deadline
-    ) external payable returns (uint256 amount0, uint256 amount1, uint256 liquidity);
-
-    function swapExactIn(
-        PoolKey calldata poolKey,
-        uint256 amountIn,
-        uint256 amountOutMin,
-        bool zeroForOne,
-        address to,
-        uint256 deadline
-    ) external payable returns (uint256 amountOut);
-
     function recoverTransientBalance(address token, uint256 id, address to)
         external
         returns (uint256 amount);
