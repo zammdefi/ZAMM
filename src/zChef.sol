@@ -255,7 +255,6 @@ contract zChef is ERC6909Lite {
     }
 
     /* ───────────────────────────── View helper ───────────────────────────── */
-
     function pendingReward(uint256 chefId, address user) public view returns (uint256) {
         Pool storage p = pools[chefId];
         if (p.end == 0) return 0;
@@ -323,7 +322,6 @@ contract zChef is ERC6909Lite {
     }
 
     /* ───────────────────────────── ETH LP ZAP ───────────────────────────── */
-
     error InvalidPoolKey();
     error SwapExactInFail();
     error AddLiquidityFail();
@@ -436,7 +434,6 @@ function safeTransferFrom(address token, address from, address to, uint256 amoun
 
 // ZAMM-like LP zap extension
 // see, 0x000000000000040470635EB91b7CE4D132D616eD
-
 address constant ZAMM_0 = 0x00000000000008882D72EfA6cCE4B6a40b24C860;
 
 struct PoolKey {
