@@ -8,7 +8,7 @@ interface IERC6909 {
     function transferFrom(address, address, uint256, uint256) external returns (bool);
 }
 
-/// ───────────────────────────── Minimal ERC-6909-Lite ──────────────────────────────
+/// ───────────────────────────── Minimal ERC6909-Lite ───────────────────────────────
 /// @notice Minimalist and gas efficient "lite" ERC6909 implementation. Serves backend for incentives.
 /// Adapted from Solmate (https://github.com/transmissions11/solmate/blob/main/src/tokens/ERC6909.sol).
 abstract contract ERC6909Lite {
@@ -32,7 +32,7 @@ abstract contract ERC6909Lite {
 }
 
 /// ─────────────────────────────── zChef Singleton ────────────────────────────────
-/// @notice ERC-6909 LP incentives staking rewards. Minimalist Multitoken MasterChef.
+/// @notice ERC6909 LP incentives staking rewards. Minimalist Multitoken MasterChef.
 contract zChef is ERC6909Lite {
     /* ───────────────────────────── Events ───────────────────────────── */
     event Sweep(uint256 indexed chefId, uint256 amount);
@@ -95,7 +95,7 @@ contract zChef is ERC6909Lite {
     error InvalidDuration();
     error PrecisionOverflow();
 
-    /// @dev `rewardId == 0` ⇢ reward is ERC-20; otherwise ERC-6909.
+    /// @notice `rewardId == 0` ⇢ reward is ERC20; otherwise ERC6909.
     function createStream(
         address lpToken,
         uint256 lpId,
@@ -137,6 +137,7 @@ contract zChef is ERC6909Lite {
     /* ───────────────────────────── Deposit / Withdraw ───────────────────────────── */
     error StreamEnded();
 
+    /// @notice Pull LP `amount` in for staking rewards for given `chefId`.
     function deposit(uint256 chefId, uint256 amount) public lock {
         require(amount != 0, ZeroAmount());
         require(amount <= type(uint128).max, Overflow());
@@ -167,6 +168,7 @@ contract zChef is ERC6909Lite {
 
     error TransferFailed();
 
+    /// @notice Pull LP `shares` out with staking rewards for given `chefId`.
     function withdraw(uint256 chefId, uint256 shares) public lock {
         require(shares != 0, ZeroAmount());
 
@@ -196,7 +198,7 @@ contract zChef is ERC6909Lite {
 
     error NoStake();
 
-    /// @dev Pull rewards.
+    /// @notice Pull just LP staking rewards for given `chefId`.
     function harvest(uint256 chefId) public lock {
         uint256 shares = balanceOf[msg.sender][chefId];
         if (shares == 0) revert NoStake();
@@ -211,7 +213,7 @@ contract zChef is ERC6909Lite {
         emit Withdraw(msg.sender, chefId, 0, pending);
     }
 
-    /// @dev Pull LP immediately, forfeit rewards.
+    /// @notice Pull LP immediately, forfeit rewards.
     function emergencyWithdraw(uint256 chefId) public lock {
         uint256 shares = balanceOf[msg.sender][chefId];
         require(shares != 0, NoStake());
@@ -232,7 +234,7 @@ contract zChef is ERC6909Lite {
     error StakeRemaining();
     error NothingToSweep();
 
-    /// @dev Reclaim undistributed rewards after the stream has ended.
+    /// @notice Reclaim undistributed rewards after the stream has ended.
     function sweepRemainder(uint256 chefId, address to) public lock {
         if (msg.sender != streamCreator[chefId]) revert Unauthorized();
 
@@ -254,7 +256,84 @@ contract zChef is ERC6909Lite {
         emit Sweep(chefId, amt);
     }
 
+    error SamePool();
+    error LPMismatch();
+
+    /// @notice Move an existing stake from one incentive stream to another
+    ///         without leaving the contract or touching the user’s wallet.
+    /// @dev    • Both pools **must** reference the same LP token and ID.
+    ///         • Pending rewards from the old pool are harvested first.
+    ///         • Reverts if the destination stream has already ended.
+    function migrate(uint256 fromChefId, uint256 toChefId, uint256 shares) public lock {
+        require(shares != 0, ZeroAmount());
+        require(fromChefId != toChefId, SamePool());
+
+        Pool storage p = _updatePool(fromChefId);
+
+        address fromLpToken = p.lpToken;
+        uint256 fromLpId = p.lpId;
+
+        uint256 uShares = balanceOf[msg.sender][fromChefId];
+        /* pending */
+        uint256 pending =
+            uShares * p.accRewardPerShare / ACC_PRECISION - userDebt[fromChefId][msg.sender];
+
+        /* burn shares & update supply */
+        _burn(msg.sender, fromChefId, shares);
+        p.totalShares -= uint128(shares);
+
+        /* pay rewards */
+        if (pending != 0) _transferOut(p.rewardToken, msg.sender, p.rewardId, pending);
+
+        /* reset debt */
+        uint256 newShares = uShares - shares;
+        userDebt[fromChefId][msg.sender] = newShares * p.accRewardPerShare / ACC_PRECISION;
+
+        emit Withdraw(msg.sender, fromChefId, shares, pending);
+
+        p = _updatePool(toChefId);
+
+        // now, also confirm migrating LP tokens actually match
+        require(fromLpToken == p.lpToken, LPMismatch());
+        require(fromLpId == p.lpId, LPMismatch());
+
+        if (block.timestamp >= p.end) revert StreamEnded();
+
+        // explicit uint256 cast avoids pre-overflow and guarantees custom error
+        require(uint256(p.totalShares) + shares <= type(uint128).max, Overflow());
+        p.totalShares += uint128(shares);
+
+        _mint(msg.sender, toChefId, shares);
+
+        /* ── update user debt ── */
+        userDebt[toChefId][msg.sender] += uint256(shares) * p.accRewardPerShare / ACC_PRECISION;
+
+        emit Deposit(msg.sender, toChefId, shares);
+    }
+
     /* ───────────────────────────── View helper ───────────────────────────── */
+    /// @notice Annualized reward flow per share, scaled by ACC_PRECISION (1e12).
+    function rewardPerSharePerYear(uint256 chefId) public view returns (uint256) {
+        Pool storage p = pools[chefId];
+        if (p.totalShares == 0 || block.timestamp >= p.end) return 0;
+        return uint256(p.rewardRate) * 365 days / p.totalShares;
+    }
+
+    /// @notice Reward per share from now until stream end.
+    function rewardPerShareRemaining(uint256 chefId) public view returns (uint256) {
+        Pool storage p = pools[chefId];
+        if (block.timestamp >= p.end || p.totalShares == 0) return 0;
+        uint256 secsLeft = p.end - block.timestamp;
+        return uint256(p.rewardRate) * secsLeft / p.totalShares; // raw tokens ×1e12
+    }
+
+    /// @notice Annualized reward flow for `user`, in raw token units.
+    function rewardPerYear(uint256 chefId, address user) public view returns (uint256) {
+        uint256 perShare = rewardPerSharePerYear(chefId);
+        return balanceOf[user][chefId] * perShare / ACC_PRECISION;
+    }
+
+    /// @notice Pending (unharvested) reward for a user in raw token units.
     function pendingReward(uint256 chefId, address user) public view returns (uint256) {
         Pool storage p = pools[chefId];
         if (p.end == 0) return 0;
@@ -272,6 +351,7 @@ contract zChef is ERC6909Lite {
     /* ───────────────────────────── Internal: pool update ───────────────────────────── */
     error NoPool();
 
+    /// @dev Update pool storage and stream accounting.
     function _updatePool(uint256 chefId) internal returns (Pool storage p) {
         p = pools[chefId];
         require(p.end != 0, NoPool());
@@ -305,6 +385,7 @@ contract zChef is ERC6909Lite {
     }
 
     /* ───────────────────────────── Token transfer helpers ───────────────────────────── */
+    /// @dev Pull tokens in. If `id` is 0, treat as ERC20.
     function _transferIn(address token, uint256 id, uint256 amt) internal {
         if (id != 0) {
             require(
@@ -316,6 +397,7 @@ contract zChef is ERC6909Lite {
         }
     }
 
+    /// @dev Push tokens out. If `id` is 0, treat as ERC20.
     function _transferOut(address token, address to, uint256 id, uint256 amt) internal {
         if (id != 0) require(IERC6909(token).transfer(to, id, amt), TransferFailed());
         else safeTransfer(token, to, amt);
@@ -326,7 +408,7 @@ contract zChef is ERC6909Lite {
     error SwapExactInFail();
     error AddLiquidityFail();
 
-    /// @dev ETH LP zap for ZAMM-like `lpSrc`.
+    /// @notice ETH LP zap for ZAMM-like `lpSrc`.
     function zapDeposit(
         address lpSrc, // e.g., ZAMM
         uint256 chefId, // incentives

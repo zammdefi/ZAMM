@@ -17,6 +17,8 @@ interface IERC6909Core {
 
 contract zChefTest is Test {
     /* ───────── supplied constants ───────── */
+    uint256 constant ACC_PRECISION = 1e12;
+
     address constant USER = 0x1C0Aa8cCD568d90d61659F060D1bFb1e6f855A20;
 
     address constant INCENTIVE_TOKEN = 0x0000000000009710cd229bF635c4500029651eE8;
@@ -668,10 +670,801 @@ contract zChefTest is Test {
             bytes32(0)
         );
     }
+
+    /* ======================================================================
+    29. Migrate from one stream to another                               */
+    function testMigrateHappyPath() public {
+        // ── create a second stream with SAME LP token & id ──
+        vm.prank(USER);
+        uint256 chefId2 = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 500 ether, 1000, bytes32("B")
+        );
+
+        // USER deposits 80 LP into stream-1
+        vm.prank(USER);
+        chef.deposit(chefId, 80);
+        assertEq(chef.balanceOf(USER, chefId), 80);
+
+        // warp 200 s so some rewards accrue
+        vm.warp(block.timestamp + 200);
+
+        // migrate 50 shares from stream-1 → stream-2
+        vm.prank(USER);
+        chef.migrate(chefId, chefId2, 50);
+
+        // ── assertions ──
+        // stream-1 balance: 80 − 50 = 30
+        assertEq(chef.balanceOf(USER, chefId), 30);
+        // stream-2 balance: 50
+        assertEq(chef.balanceOf(USER, chefId2), 50);
+
+        // pending in stream-1 should be zero immediately after migrate
+        assertEq(chef.pendingReward(chefId, USER), 0);
+
+        // user debt in stream-2 must equal shares × acc
+        (,,,,,, /*lastUpdate*/,, uint256 acc2) = chef.pools(chefId2);
+        uint256 debt2 = chef.userDebt(chefId2, USER);
+        assertEq(debt2, 50 * acc2 / ACC_PRECISION, "debt mismatch after migrate");
+
+        // LP token balances inside chef: 30 + 50 = 80
+        assertEq(IERC6909Core(LP_TOKEN).balanceOf(address(chef), LP_ID), 80);
+    }
+
+    /* ======================================================================
+    30. Migrate reverts on LP mismatch                                     */
+    function testMigrateLPMismatchReverts() public {
+        // create stream with DIFFERENT LP-ID
+        uint256 wrongId = LP_ID + 1;
+        vm.prank(USER);
+        uint256 badStream = chef.createStream(
+            LP_TOKEN, wrongId, INCENTIVE_TOKEN, INCENTIVE_ID, 100 ether, 500, bytes32("BAD")
+        );
+
+        vm.prank(USER);
+        chef.deposit(chefId, 10);
+
+        vm.prank(USER);
+        vm.expectRevert(zChef.LPMismatch.selector);
+        chef.migrate(chefId, badStream, 5);
+    }
+
+    /* ======================================================================
+    31. Migrate reverts if destination stream ended                        */
+    function testMigrateStreamEndedReverts() public {
+        vm.prank(USER);
+        uint256 ended = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 10 ether, 10, bytes32("END")
+        );
+
+        // let it finish
+        vm.warp(block.timestamp + 20);
+
+        vm.prank(USER);
+        chef.deposit(chefId, 10);
+
+        vm.prank(USER);
+        vm.expectRevert(zChef.StreamEnded.selector);
+        chef.migrate(chefId, ended, 5);
+    }
+
+    /* ======================================================================
+    32. View helpers: rewardPerSharePerYear / Remaining / perYear          */
+    function testViewHelpers() public {
+        // USER stakes 100 LP at t = 0
+        vm.prank(USER);
+        chef.deposit(chefId, 100);
+
+        // immediate call: perSharePerYear = rate * 365d / totalShares
+        // pull the Pool struct and extract rewardRate (index 4)
+        (,,,, uint128 rewardRate,,,,) = chef.pools(chefId);
+        uint256 rate = uint256(rewardRate); // already × 1e12
+
+        uint256 expectAnnual = rate * 365 days / 100;
+        assertEq(chef.rewardPerSharePerYear(chefId), expectAnnual);
+
+        // after 250 s
+        vm.warp(block.timestamp + 250);
+
+        uint256 remaining = chef.rewardPerShareRemaining(chefId);
+        (,,,,, uint64 endTs,,,) = chef.pools(chefId);
+        uint256 secsLeft = endTs - block.timestamp;
+        uint256 expectRem = rate * secsLeft / 100;
+        assertEq(remaining, expectRem);
+
+        uint256 perYearUser = chef.rewardPerYear(chefId, USER);
+        assertEq(perYearUser, expectAnnual * 100 / ACC_PRECISION);
+
+        // sanity: pendingReward ≈ rate * 250 / 100
+        uint256 pending = chef.pendingReward(chefId, USER);
+        uint256 expectPend = rate * 250 / ACC_PRECISION; // 250 tokens (2.5e20 wei)
+        assertApproxEqAbs(pending, expectPend, 1);
+    }
+
+    /* ======================================================================
+    33. migrate() revert must leave destination pool state unchanged
+    ====================================================================== */
+    function testMigrateRevertLeavesPoolUntouched() public {
+        // ── create a destination stream that WILL mismatch on LP-ID ──
+        uint256 badId = LP_ID + 42;
+        vm.prank(USER);
+        uint256 badStream = chef.createStream(
+            LP_TOKEN,
+            badId, // ← different ID ⇒ mismatch
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            100 ether,
+            1_000,
+            bytes32("BAD")
+        );
+
+        // capture baseline state
+        uint64 endBefore = _end(badStream);
+        uint64 luBefore = _lastUpdate(badStream);
+
+        // user adds a small stake to the *source* pool
+        vm.prank(USER);
+        chef.deposit(chefId, 10);
+
+        // warp so _updatePool() (if it ran) would definitely change timestamps
+        vm.warp(block.timestamp + 123);
+
+        // expect revert and call migrate
+        vm.prank(USER);
+        vm.expectRevert(zChef.LPMismatch.selector);
+        chef.migrate(chefId, badStream, 5);
+
+        // destination pool must be byte-for-byte identical to baseline
+        assertEq(_end(badStream), endBefore, "end mutated");
+        assertEq(_lastUpdate(badStream), luBefore, "lastUpdate mutated");
+    }
+
+    /* ======================================================================
+    34. migrate()  ==  withdraw(…) + deposit(…)  equivalence test
+    ====================================================================== */
+    function testMigrateEquivalenceToWithdrawDeposit() public {
+        // ── second stream with SAME LP (so migrate will succeed) ──
+        vm.prank(USER);
+        uint256 chefId2 = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 500 ether, 1_000, bytes32("EQ")
+        );
+
+        // user stakes 120 LP into stream-1
+        vm.prank(USER);
+        chef.deposit(chefId, 120);
+
+        // accrue some rewards
+        vm.warp(block.timestamp + 250);
+
+        // take a full-chain snapshot for differential run
+        uint256 snap = vm.snapshot();
+
+        /* —— PATH A : single-call migrate() —— */
+        vm.prank(USER);
+        chef.migrate(chefId, chefId2, 60);
+
+        uint256 s1A = chef.balanceOf(USER, chefId);
+        uint256 s2A = chef.balanceOf(USER, chefId2);
+        uint256 d1A = chef.userDebt(chefId, USER);
+        uint256 d2A = chef.userDebt(chefId2, USER);
+        uint256 incA = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+
+        // roll chain state back
+        vm.revertTo(snap);
+
+        /* —— PATH B : withdraw(60) then deposit(60) —— */
+        vm.startPrank(USER);
+        chef.withdraw(chefId, 60); // pays pending & returns LP
+        chef.deposit(chefId2, 60); // re-stakes into second pool
+        vm.stopPrank();
+
+        uint256 s1B = chef.balanceOf(USER, chefId);
+        uint256 s2B = chef.balanceOf(USER, chefId2);
+        uint256 d1B = chef.userDebt(chefId, USER);
+        uint256 d2B = chef.userDebt(chefId2, USER);
+        uint256 incB = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+
+        /* —— assert equivalence —— */
+        assertEq(s1A, s1B, "shares-1 mismatch");
+        assertEq(s2A, s2B, "shares-2 mismatch");
+        assertEq(d1A, d1B, "debt-1 mismatch");
+        assertEq(d2A, d2B, "debt-2 mismatch");
+        assertEq(incA, incB, "incentive token balance mismatch");
+    }
+
+    /* ======================================================================
+    35. deposit amount > uint128.max must revert Overflow
+    ====================================================================== */
+    function testDepositOverflowReverts() public {
+        uint256 huge = uint256(type(uint128).max) + 1; // 2^128 + 1
+        vm.prank(USER);
+        vm.expectRevert(zChef.Overflow.selector);
+        chef.deposit(chefId, huge);
+    }
+
+    /* ======================================================================
+    36. createStream: reward-rate overflow must revert Overflow
+           (passes PrecisionOverflow guard but fails uint128 cast)
+    ====================================================================== */
+    function testCreateStreamRateOverflowReverts() public {
+        // amount chosen so: amount * 1e12  >  uint128.max, but amount ≤ uint256.max / 1e12
+        uint256 big = uint256(type(uint128).max) / ACC_PRECISION + 1;
+        address stub = address(new StubERC20()); // returns no data, fine for _transferIn
+
+        vm.prank(USER);
+        vm.expectRevert(zChef.Overflow.selector);
+        chef.createStream(
+            LP_TOKEN,
+            LP_ID,
+            stub,
+            0, // rewardId = 0  (ERC-20 path)
+            big,
+            1, // 1-second duration triggers max rate
+            bytes32("O")
+        );
+    }
+
+    /* ======================================================================
+    37. migrate() with identical from/to chefId must revert SamePool
+    ====================================================================== */
+    function testMigrateSamePoolReverts() public {
+        vm.prank(USER);
+        chef.deposit(chefId, 10);
+
+        vm.prank(USER);
+        vm.expectRevert(zChef.SamePool.selector);
+        chef.migrate(chefId, chefId, 5);
+    }
+
+    /* ======================================================================
+    38. migrate() with shares == 0 must revert ZeroAmount
+    ====================================================================== */
+    function testMigrateZeroAmountReverts() public {
+        // set up a valid destination stream first
+        vm.prank(USER);
+        uint256 chefId2 = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 100 ether, 1_000, bytes32("ZZ")
+        );
+
+        vm.prank(USER);
+        vm.expectRevert(zChef.ZeroAmount.selector);
+        chef.migrate(chefId, chefId2, 0);
+    }
+
+    /* ======================================================================
+    39. deposit that would push totalShares > uint128.max must revert Overflow
+           (uses a mock ERC-6909 so transferFrom() never fails)
+    ====================================================================== */
+    function testDepositTotalSharesOverflow() public {
+        /* ── deploy a dummy LP token that always succeeds ── */
+        DummyLP lp = new DummyLP();
+
+        /* creator approves chef */
+        vm.prank(USER);
+        lp.setOperator(address(chef), true);
+
+        /* create a new stream that points at the dummy LP                      *
+         * reward token can be any ERC-20/6909; we re-use INCENTIVE_TOKEN here */
+        vm.prank(USER);
+        uint256 dummyChef = chef.createStream(
+            address(lp),
+            0, // lpId
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            1 ether, // small reward, irrelevant
+            1_000,
+            bytes32("OVER")
+        );
+
+        /* near-max deposit succeeds */
+        uint128 nearMax = type(uint128).max - 10;
+        vm.prank(USER);
+        chef.deposit(dummyChef, nearMax);
+
+        /* next deposit of 11 shares would overflow uint128 */
+        vm.prank(USER);
+        vm.expectRevert(zChef.Overflow.selector);
+        chef.deposit(dummyChef, 11);
+    }
+
+    /* ======================================================================
+    40. createStream where amount * 1e12 / duration > uint128.max reverts
+    ====================================================================== */
+    function testCreateStreamRateCastOverflow() public {
+        // pick (amount, duration) pair that passes PrecisionOverflow but
+        // overflows uint128 when multiplied by ACC_PRECISION / duration.
+        uint256 amount = uint256(type(uint128).max) / ACC_PRECISION + 2;
+        uint64 duration = 1; // 1-second ⇒ rewardRate = amount * 1e12
+
+        address stub = address(new StubERC20());
+        vm.prank(USER);
+        vm.expectRevert(zChef.Overflow.selector);
+        chef.createStream(
+            LP_TOKEN,
+            LP_ID,
+            stub,
+            0, // ERC-20 path
+            amount,
+            duration,
+            bytes32("O-CAST")
+        );
+    }
+
+    /* ======================================================================
+    41. emergencyWithdraw with zero stake reverts NoStake
+    ====================================================================== */
+    function testEmergencyWithdrawNoStakeReverts() public {
+        vm.prank(USER);
+        vm.expectRevert(zChef.NoStake.selector);
+        chef.emergencyWithdraw(chefId);
+    }
+
+    /* ======================================================================
+    42. Re-entrancy guard: LP token tries to reenter deposit(), chef blocks it
+    ====================================================================== */
+    function testReentrancyGuardBlocksLPCallback() public {
+        /* step 1: deploy a malicious ERC-6909 LP token */
+        ReentrantLP lp = new ReentrantLP(chef);
+
+        /* step 2: user approves chef as operator */
+        vm.prank(USER);
+        lp.setOperator(address(chef), true);
+
+        /* step 3: create a stream that uses the malicious LP */
+        vm.prank(USER);
+        uint256 badChefId = chef.createStream(
+            address(lp),
+            0, // lpId
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            10 ether,
+            1000,
+            bytes32("REENT")
+        );
+
+        /* hand the reentrant contract its chefId so it can reenter correctly */
+        lp.setChefId(badChefId);
+
+        /* step 4: user’s deposit should revert with Reentrancy() */
+        vm.prank(USER);
+        vm.expectRevert(zChef.Reentrancy.selector);
+        chef.deposit(badChefId, 1);
+    }
+
+    /* ======================================================================
+    43. Three-user timeline stress: interleaved deposits & withdrawals
+         – final version with correct U2 vs U3 differential
+    ====================================================================== */
+    function testThreeUserStress() public {
+        address U2 = address(0x2222);
+        address U3 = address(0x3333);
+
+        /* ── give LP to U2 & U3, set approvals ───────────────────────── */
+        vm.startPrank(USER);
+        IERC6909Core(LP_TOKEN).transfer(U2, LP_ID, 150);
+        IERC6909Core(LP_TOKEN).transfer(U3, LP_ID, 150);
+        vm.stopPrank();
+        vm.prank(U2);
+        IERC6909Core(LP_TOKEN).setOperator(address(chef), true);
+        vm.prank(U3);
+        IERC6909Core(LP_TOKEN).setOperator(address(chef), true);
+
+        /* record starting reward balances */
+        uint256 b1Start = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+        uint256 b2Start = IERC6909Core(INCENTIVE_TOKEN).balanceOf(U2, INCENTIVE_ID);
+        uint256 b3Start = IERC6909Core(INCENTIVE_TOKEN).balanceOf(U3, INCENTIVE_ID);
+
+        /* ── timeline ───────────────────────────────────────────────── */
+        vm.prank(USER);
+        chef.deposit(chefId, 100); // t = 0  (U1)
+        vm.prank(U2);
+        chef.deposit(chefId, 100); // t = 0  (U2)
+
+        vm.warp(block.timestamp + 200); // t = 200
+        vm.prank(U3);
+        chef.deposit(chefId, 100); // U3 joins
+        vm.prank(USER);
+        chef.withdraw(chefId, 40); // U1 exits 40
+
+        vm.warp(block.timestamp + 800); // t = 1000 (end)
+        vm.prank(USER);
+        chef.withdraw(chefId, 60);
+        vm.prank(U2);
+        chef.withdraw(chefId, 100);
+        vm.prank(U3);
+        chef.withdraw(chefId, 100);
+
+        /* ── earned amounts (deltas) ───────────────────────────────── */
+        uint256 e1 = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID) - b1Start;
+        uint256 e2 = IERC6909Core(INCENTIVE_TOKEN).balanceOf(U2, INCENTIVE_ID) - b2Start;
+        uint256 e3 = IERC6909Core(INCENTIVE_TOKEN).balanceOf(U3, INCENTIVE_ID) - b3Start;
+
+        /* residue: integer-division dust left in chef */
+        uint256 residue = IERC6909Core(INCENTIVE_TOKEN).balanceOf(address(chef), INCENTIVE_ID);
+
+        /* 1) Conservation: payouts + residue == stream total (1 000 tokens) */
+        assertEq(e1 + e2 + e3 + residue, 1_000 * 1 ether, "total reward mismatch");
+
+        /* 2) Residue should be < number of stakers (≤3 wei) */
+        assertLt(residue, 3, "unexpected large residue");
+
+        /* 3) U2 earned exactly 100 tokens more than U3 (200-sec head-start) */
+        uint256 diff = e2 > e3 ? e2 - e3 : e3 - e2;
+        assertApproxEqAbs(diff, 100 * 1 ether, 1e12); // 1 µtoken tolerance
+
+        /* 4) U1 earned less than both U2 and U3 */
+        assertLt(e1, e3, "U1 should earn less than U3");
+
+        /* 5) Chef now holds zero LP */
+        assertEq(
+            IERC6909Core(LP_TOKEN).balanceOf(address(chef), LP_ID), 0, "chef LP balance not empty"
+        );
+    }
+
+    /* ======================================================================
+    44. Withdraw after stream end still works and pays final rewards
+    ====================================================================== */
+    function testWithdrawAfterEnd() public {
+        vm.prank(USER);
+        chef.deposit(chefId, 42);
+
+        vm.warp(block.timestamp + 1_050); // 50 s after end
+        uint256 pending = chef.pendingReward(chefId, USER);
+        assertGt(pending, 0, "should have final rewards");
+
+        uint256 balBefore = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+        vm.prank(USER);
+        chef.withdraw(chefId, 42);
+        uint256 balAfter = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+
+        assertEq(balAfter - balBefore, pending, "paid exact pending");
+        assertEq(chef.balanceOf(USER, chefId), 0);
+    }
+
+    /* ======================================================================
+    45. Dust-rounding sweep (delta-based, no “chef == 0” assumption)
+    ====================================================================== */
+    function testSweepRoundingDust() public {
+        /* tiny stream: 3 units over 2 s */
+        vm.prank(USER);
+        uint256 id = chef.createStream(
+            LP_TOKEN,
+            LP_ID,
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            3, // raw units (wei-denominated token)
+            2, // duration
+            bytes32("DUST")
+        );
+
+        /* let it finish */
+        vm.warp(block.timestamp + 4);
+
+        /* record balances before sweep */
+        uint256 userBefore = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+        uint256 chefBefore = IERC6909Core(INCENTIVE_TOKEN).balanceOf(address(chef), INCENTIVE_ID);
+
+        /* sweep */
+        vm.prank(USER);
+        chef.sweepRemainder(id, USER);
+
+        /* balances after sweep */
+        uint256 userAfter = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+        uint256 chefAfter = IERC6909Core(INCENTIVE_TOKEN).balanceOf(address(chef), INCENTIVE_ID);
+
+        /* user gained exactly 3 units */
+        assertEq(userAfter - userBefore, 3, "sweep amount incorrect");
+
+        /* chef lost exactly 3 units */
+        assertEq(chefBefore - chefAfter, 3, "chef balance delta incorrect");
+    }
+
+    /* ======================================================================
+    46. Same-block harvest + migrate behaves correctly
+    ====================================================================== */
+    function testHarvestThenMigrateSameBlock() public {
+        vm.prank(USER);
+        chef.deposit(chefId, 70);
+        vm.warp(block.timestamp + 400);
+        // create second stream
+        vm.prank(USER);
+        uint256 cid2 = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 200 ether, 600, bytes32("HM")
+        );
+
+        // single transaction block: harvest then migrate
+        vm.startPrank(USER);
+        chef.harvest(chefId);
+        chef.migrate(chefId, cid2, 30); // move part
+        vm.stopPrank();
+
+        // Accounting invariants
+        assertEq(chef.balanceOf(USER, chefId), 40);
+        assertEq(chef.balanceOf(USER, cid2), 30);
+        // debts must equal shares*acc
+        uint256 d1 = chef.userDebt(chefId, USER);
+        uint256 d2 = chef.userDebt(cid2, USER);
+        (,,,,,,,, uint256 acc1) = chef.pools(chefId);
+        (,,,,,,,, uint256 acc2) = chef.pools(cid2);
+        assertEq(d1, 40 * acc1 / ACC_PRECISION);
+        assertEq(d2, 30 * acc2 / ACC_PRECISION);
+    }
+
+    /* ======================================================================
+    47. Invariant fuzz: totalShares and userDebt invariant
+         (quick, 100 random actions, no external oracle)
+    ====================================================================== */
+    function testInvariantQuickFuzz() public {
+        uint256 actions = 100;
+        for (uint256 i; i < actions; ++i) {
+            uint8 choice = uint8(uint256(keccak256(abi.encodePacked(i, block.number))) % 4);
+            if (choice == 0) {
+                // deposit
+                uint256 amt = 1 + (i % 5);
+                vm.prank(USER);
+                chef.deposit(chefId, amt);
+            } else if (choice == 1) {
+                // withdraw
+                uint256 bal = chef.balanceOf(USER, chefId);
+                if (bal > 0) {
+                    uint256 amt = 1 + (i % bal);
+                    vm.prank(USER);
+                    chef.withdraw(chefId, amt);
+                }
+            } else if (choice == 2) {
+                // harvest
+                if (chef.balanceOf(USER, chefId) > 0) {
+                    vm.prank(USER);
+                    chef.harvest(chefId);
+                }
+            } else {
+                // time warp
+                vm.warp(block.timestamp + 5 + (i % 20));
+            }
+        }
+
+        // Invariant: pool.totalShares == user's balanceOf after fuzz run
+        (,,,,,,, uint128 totalShares,) = chef.pools(chefId);
+        assertEq(totalShares, uint128(chef.balanceOf(USER, chefId)), "totalShares mismatch");
+    }
+
+    /* ======================================================================
+    48. Migrate 100 % of user’s stake – source pool ends at zero
+    ====================================================================== */
+    function testMigrateFullStake() public {
+        // destination stream with same LP
+        vm.prank(USER);
+        uint256 dst = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 200 ether, 1_000, bytes32("FULL")
+        );
+
+        vm.prank(USER);
+        chef.deposit(chefId, 30);
+
+        // migrate ALL shares
+        vm.prank(USER);
+        chef.migrate(chefId, dst, 30);
+
+        assertEq(chef.balanceOf(USER, chefId), 0, "source balance not zero");
+        assertEq(chef.balanceOf(USER, dst), 30, "dest balance wrong");
+    }
+
+    /* ======================================================================
+    49. Migrate near destination end:
+      – succeed at end-1, revert after end (StreamEnded)
+    ====================================================================== */
+    function testMigrateNearEnd() public {
+        /* 1.  destination stream (10-second duration) */
+        vm.prank(USER);
+        uint256 dst = chef.createStream(
+            LP_TOKEN,
+            LP_ID,
+            INCENTIVE_TOKEN,
+            INCENTIVE_ID,
+            20 ether, // reward
+            10, // duration 10 s
+            bytes32("NEAR")
+        );
+
+        /* seed the destination with 1 share so totalShares>0
+       (prevents idle-extension during later migrate) */
+        vm.prank(USER);
+        chef.deposit(dst, 1);
+
+        /* 2.  source stake */
+        vm.prank(USER);
+        chef.deposit(chefId, 5);
+
+        /* 3.  warp to just BEFORE dst.end */
+        vm.warp(_end(dst) - 1);
+
+        /* first migrate should SUCCEED */
+        vm.prank(USER);
+        chef.migrate(chefId, dst, 2);
+
+        /* 4.  warp 2 s → now PAST end */
+        vm.warp(_end(dst) + 1);
+
+        /* second migrate should REVERT with StreamEnded */
+        vm.prank(USER);
+        vm.expectRevert(zChef.StreamEnded.selector);
+        chef.migrate(chefId, dst, 1);
+    }
+
+    /* ======================================================================
+    50. harvest → migrate → harvest again in same block (second harvest zero)
+    ====================================================================== */
+    function testHarvestMigrateHarvestZero() public {
+        vm.prank(USER);
+        uint256 dst = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 300 ether, 600, bytes32("HMH")
+        );
+
+        vm.prank(USER);
+        chef.deposit(chefId, 50);
+
+        vm.warp(block.timestamp + 200);
+
+        vm.startPrank(USER);
+        chef.harvest(chefId); // first harvest pays rewards
+        chef.migrate(chefId, dst, 20); // move part of stake
+        chef.harvest(chefId); // should be zero
+        vm.stopPrank();
+
+        assertEq(chef.pendingReward(chefId, USER), 0, "pending should be zero");
+    }
+
+    /* ======================================================================
+    51. Two users migrate concurrently – totalShares stays consistent
+    ====================================================================== */
+    function testConcurrentMigrateTotals() public {
+        address U2 = address(0xBEEF);
+        vm.prank(U2);
+        IERC6909Core(LP_TOKEN).setOperator(address(chef), true);
+        vm.startPrank(USER);
+        IERC6909Core(LP_TOKEN).transfer(U2, LP_ID, 50);
+        vm.stopPrank();
+
+        vm.prank(USER);
+        chef.deposit(chefId, 40);
+        vm.prank(U2);
+        chef.deposit(chefId, 50);
+
+        vm.warp(block.timestamp + 100);
+
+        // destination stream
+        vm.prank(USER);
+        uint256 dst = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 400 ether, 1_000, bytes32("TOT")
+        );
+
+        // both migrate
+        vm.prank(USER);
+        chef.migrate(chefId, dst, 40);
+        vm.prank(U2);
+        chef.migrate(chefId, dst, 50);
+
+        // invariant: pool.totalShares == sum(balanceOf)
+        (,,,,,,, uint128 totalShares,) = chef.pools(dst);
+        uint256 sum = chef.balanceOf(USER, dst) + chef.balanceOf(U2, dst);
+        assertEq(totalShares, sum, "totalShares invariant broken");
+    }
+
+    /* ======================================================================
+    52. Migrate AFTER source stream ended into new active stream
+    ====================================================================== */
+    function testMigrateFromEndedStream() public {
+        /* USER stakes 30 into the original stream */
+        vm.prank(USER);
+        chef.deposit(chefId, 30);
+
+        /* warp past source end */
+        vm.warp(_end(chefId) + 5);
+
+        uint256 pending = chef.pendingReward(chefId, USER);
+        assertGt(pending, 0);
+
+        /* ── create DESTINATION stream first ──
+       (this transferFrom reduces user's balance, so balance snapshot
+        must be taken *after* creation)                                   */
+        vm.prank(USER);
+        uint256 dst = chef.createStream(
+            LP_TOKEN, LP_ID, INCENTIVE_TOKEN, INCENTIVE_ID, 200 ether, 1_000, bytes32("POST-END")
+        );
+
+        /* record balance AFTER paying for new stream */
+        uint256 balBefore = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+
+        /* migrate all 30 shares */
+        vm.prank(USER);
+        chef.migrate(chefId, dst, 30);
+
+        /* ── assertions ───────────────────────────────────── */
+
+        /* 1) source zero, dst 30 */
+        assertEq(chef.balanceOf(USER, chefId), 0);
+        assertEq(chef.balanceOf(USER, dst), 30);
+
+        /* 2) user received exactly the pending amount */
+        uint256 balAfter = IERC6909Core(INCENTIVE_TOKEN).balanceOf(USER, INCENTIVE_ID);
+        assertEq(balAfter - balBefore, pending, "migrate did not pay pending");
+
+        /* 3) debt formula in destination */
+        (,,,,,,,, uint256 accDst) = chef.pools(dst);
+        uint256 debt = chef.userDebt(dst, USER);
+        assertEq(debt, 30 * accDst / ACC_PRECISION);
+
+        /* 4) totalShares invariant */
+        (,,,,,,, uint128 total,) = chef.pools(dst);
+        assertEq(total, 30);
+    }
 }
 
 /* ───────── Mini token that returns NO data ───────── */
 contract StubERC20 {
     function transfer(address, uint256) external {}
     function transferFrom(address, address, uint256) external {}
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Helper: a minimal ERC-6909 token that reenters chef.deposit() in transferFrom */
+contract ReentrantLP is IERC6909Core {
+    zChef public immutable chef;
+    uint256 public chefId;
+
+    constructor(zChef _chef) {
+        chef = _chef;
+    }
+
+    /* allow test to inject the correct chefId after the stream is created */
+    function setChefId(uint256 id) external {
+        chefId = id;
+    }
+
+    /* IERC6909Core -- only the four functions actually called in tests */
+    function setOperator(address, bool) external pure returns (bool) {
+        return true;
+    }
+
+    function balanceOf(address, uint256) external pure returns (uint256) {
+        return type(uint256).max;
+    }
+
+    function transfer(address, uint256, uint256) external pure returns (bool) {
+        return true;
+    }
+
+    function transferFrom(address, address, uint256, uint256) external returns (bool) {
+        // first call reenters chef.deposit(); the reentrancy guard will revert
+        if (chefId != 0) {
+            uint256 id = chefId;
+            chefId = 0; // ensure one-shot to avoid infinite loop
+            chef.deposit(id, 1);
+        }
+        return true;
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Simple ERC-6909 stub: all transfers succeed, no balance bookkeeping       */
+contract DummyLP is IERC6909Core {
+    mapping(address => bool) public isOperator;
+
+    /* IERC6909Core stubs */
+    function setOperator(address operator, bool approved) external returns (bool) {
+        isOperator[operator] = approved;
+        return true;
+    }
+
+    function transfer(address, uint256, uint256) external pure returns (bool) {
+        return true;
+    }
+
+    function transferFrom(address, address, uint256, uint256) external view returns (bool) {
+        require(isOperator[msg.sender], "not operator");
+        return true;
+    }
+
+    function balanceOf(address, uint256) external pure returns (uint256) {
+        return type(uint256).max;
+    }
 }
