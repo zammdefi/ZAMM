@@ -4,9 +4,13 @@ A Minimal Multitoken AMM. By [z0r0z](https://x.com/z0r0zzz).
 
 Deployed to [`0x000000000000040470635EB91b7CE4D132D616eD`](https://contractscan.xyz/contract/0x000000000000040470635EB91b7CE4D132D616eD).
 
-This deployment includes an embedded orderbook and timelock extension.
+This deployment includes an embedded orderbook and timelock extension. See [V0](https://contractscan.xyz/contract/0x00000000000008882D72EfA6cCE4B6a40b24C860) for previous deployment.
 
 Docs: [docs.zamm.eth.limo](https://docs.zamm.eth.limo/)
+
+## Incentives
+
+zChef: [`0x00000000009991E374a1628e3B2f60991Bc26DA4`](https://contractscan.xyz/contract/0x00000000009991E374a1628e3B2f60991Bc26DA4)
 
 ## Periphery
 
