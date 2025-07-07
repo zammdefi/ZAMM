@@ -514,7 +514,6 @@ contract zChefTest is Test {
     /* ======================================================================
        26. Zap‐deposit 1 ETH into the chef via ZAMM_0
     ====================================================================== */
-
     function testZapDepositETHIntoChef() public {
         // give USER some ETH
         vm.deal(USER, 1 ether);
@@ -558,7 +557,6 @@ contract zChefTest is Test {
     /* ======================================================================
        26. Zap‐deposit 1 ETH into the chef via ZAMM_1
     ====================================================================== */
-
     function testZapDepositETHIntoChefDiffZamm() public {
         address LP = 0x000000000000040470635EB91b7CE4D132D616eD;
         uint256 ID = 3866052644274159259257513057556902007700018844572780589640963787229397380392;
@@ -1940,7 +1938,110 @@ contract zChefTest is Test {
     function _acc(uint256 id) internal view returns (uint256 acc) {
         (,,,,,,,, acc) = chef.pools(id);
     }
+
+    /* ======================================================================
+       71. zapDeposit with unapproved AMM reverts InvalidPoolAMM
+    ====================================================================== */
+    function testZapDepositInvalidAMMReverts() public {
+        // fund USER with 1 ETH
+        vm.deal(USER, 1 ether);
+
+        // build a valid PoolKey for ETH→LP
+        PoolKey memory pk = PoolKey({
+            id0: 0,
+            id1: INCENTIVE_ID,
+            token0: address(0),
+            token1: INCENTIVE_TOKEN,
+            feeOrHook: 100
+        });
+
+        address fakeAMM = address(0xDEAD);
+
+        vm.prank(USER);
+        vm.expectRevert(zChef.InvalidPoolAMM.selector);
+        chef.zapDeposit{value: 1 ether}(
+            fakeAMM,
+            chefId,
+            pk,
+            /* amountOutMin */
+            0,
+            /* amount0Min   */
+            0,
+            /* amount1Min   */
+            0,
+            /* deadline     */
+            block.timestamp + 1
+        );
+    }
+
+    /* ======================================================================
+       72. zapDeposit against a valid AMM pool but wrong chefId → InvalidPoolId
+    ====================================================================== */
+    function testZapDepositMismatchedPoolIdReverts() public {
+        // give USER some ETH
+        vm.deal(USER, 1 ether);
+
+        // build a valid ETH⇄incentive-token PoolKey for ZAMM,
+        // but use a different id1 than the one this chefId was created with
+        PoolKey memory pk = PoolKey({
+            id0: 0,
+            id1: 1421709707523477769837245049777338052901480487276,
+            token0: address(0),
+            token1: INCENTIVE_TOKEN,
+            feeOrHook: 100 // 1% fee
+        });
+
+        vm.prank(USER);
+        vm.expectRevert(zChef.InvalidPoolId.selector);
+        chef.zapDeposit{value: 1 ether}(
+            LP_TOKEN, // approved ZAMM singleton
+            chefId, // stream that expects the original LP_ID
+            pk,
+            /* amountOutMin */
+            0,
+            /* amount0Min   */
+            0,
+            /* amount1Min   */
+            0,
+            /* deadline     */
+            block.timestamp + 1
+        );
+    }
+
+    /* ======================================================================
+       73. zapDeposit that fails the swapExactIn (bad amountOutMin) reverts SwapExactInFail
+    ====================================================================== */
+    function testZapDepositSwapExactInFailReverts() public {
+        vm.deal(USER, 1 ether);
+
+        PoolKey memory pk = PoolKey({
+            id0: 0,
+            id1: INCENTIVE_ID,
+            token0: address(0),
+            token1: INCENTIVE_TOKEN,
+            feeOrHook: 100
+        });
+
+        // set amountOutMin impossibly high to force a revert inside ZAMM.swapExactIn
+        vm.prank(USER);
+        vm.expectRevert(zChef.SwapExactInFail.selector);
+        chef.zapDeposit{value: 1 ether}(
+            LP_TOKEN,
+            chefId,
+            pk,
+            /* amountOutMin */
+            1_000_000 ether,
+            /* amount0Min   */
+            0,
+            /* amount1Min   */
+            0,
+            block.timestamp + 1
+        );
+    }
 }
+
+address constant ZAMM_0 = 0x00000000000008882D72EfA6cCE4B6a40b24C860;
+address constant ZAMM_1 = 0x000000000000040470635EB91b7CE4D132D616eD;
 
 /* ───────── Mini token that returns NO data ───────── */
 contract StubERC20 {

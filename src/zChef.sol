@@ -404,7 +404,9 @@ contract zChef is ERC6909Lite {
     }
 
     /* ───────────────────────────── ETH LP ZAP ───────────────────────────── */
+    error InvalidPoolId();
     error InvalidPoolKey();
+    error InvalidPoolAMM();
     error SwapExactInFail();
     error AddLiquidityFail();
 
@@ -420,6 +422,7 @@ contract zChef is ERC6909Lite {
     ) public payable lock returns (uint256 amount0, uint256 amount1, uint256 liquidity) {
         unchecked {
             require(poolKey.token0 == address(0), InvalidPoolKey());
+            require(lpSrc == ZAMM_0 || lpSrc == ZAMM_1, InvalidPoolAMM());
 
             assembly ("memory-safe") {
                 pop(call(gas(), lpSrc, callvalue(), codesize(), 0x00, codesize(), 0x00))
@@ -458,6 +461,9 @@ contract zChef is ERC6909Lite {
 
         Pool storage p = _updatePool(chefId);
 
+        require(p.lpToken == lpSrc, LPMismatch());
+        require(p.lpId == _computePoolId(poolKey), InvalidPoolId());
+
         if (block.timestamp >= p.end) revert StreamEnded();
 
         uint128 shares = uint128(liquidity); // 1:1
@@ -472,6 +478,13 @@ contract zChef is ERC6909Lite {
         userDebt[chefId][msg.sender] += uint256(shares) * p.accRewardPerShare / ACC_PRECISION;
 
         emit Deposit(msg.sender, chefId, liquidity);
+    }
+
+    /// @dev Compute the hashed pool key Id for LP checks.
+    function _computePoolId(PoolKey memory poolKey) internal pure returns (uint256 poolId) {
+        assembly ("memory-safe") {
+            poolId := keccak256(poolKey, 0xa0)
+        }
     }
 }
 
@@ -513,9 +526,9 @@ function safeTransferFrom(address token, address from, address to, uint256 amoun
     }
 }
 
-// ZAMM-like LP zap extension
-// see, 0x000000000000040470635EB91b7CE4D132D616eD
+// ZAMM LP zap extension utils
 address constant ZAMM_0 = 0x00000000000008882D72EfA6cCE4B6a40b24C860;
+address constant ZAMM_1 = 0x000000000000040470635EB91b7CE4D132D616eD;
 
 struct PoolKey {
     uint256 id0;
