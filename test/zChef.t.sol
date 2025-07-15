@@ -2,7 +2,7 @@
 pragma solidity ^0.8.30;
 
 import "forge-std/Test.sol";
-import {PoolKey, zChef} from "../src/zChef.sol";
+import {PoolKey, zChef} from "../periphery/zChef.sol";
 
 error TransferFailed();
 error TransferFromFailed();
