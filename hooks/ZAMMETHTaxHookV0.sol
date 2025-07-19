@@ -38,7 +38,7 @@ contract ZAMMETHTaxHookV0 {
         // Pool sanity
         require(poolKey.token0 == address(0) && poolKey.id0 == 0, InvalidPoolKey());
         require(poolKey.token1 == token1 && poolKey.id1 == 0, InvalidPoolKey());
-        _verifyHook(poolKey);
+        _verifyHook(poolKey.feeOrHook);
 
         uint256 bps = taxRate;
 
@@ -80,7 +80,7 @@ contract ZAMMETHTaxHookV0 {
         // Pool sanity
         require(poolKey.token0 == address(0) && poolKey.id0 == 0, InvalidPoolKey());
         require(poolKey.token1 == token1 && poolKey.id1 == 0, InvalidPoolKey());
-        _verifyHook(poolKey);
+        _verifyHook(poolKey.feeOrHook);
 
         uint256 bps = taxRate;
 
@@ -203,11 +203,10 @@ contract ZAMMETHTaxHookV0 {
     error HookMismatch();
 
     /* ─── hook‑matching guard ───────────────────────────────────────
-     Ensures the pool’s feeOrHook is exactly:
+     Ensures the pool’s `feeOrHook` is exactly:
          FLAG_BEFORE | address(this)
      i.e. before‑hook only, no after‑hook flag, no fee‑bps value. */
-    function _verifyHook(PoolKey calldata pk) internal view {
-        uint256 v = pk.feeOrHook;
+    function _verifyHook(uint256 v) internal view {
         require(
             (v & ADDR_MASK) == uint256(uint160(address(this))) && (v & FLAG_BEFORE) != 0
                 && (v & FLAG_AFTER) == 0,
