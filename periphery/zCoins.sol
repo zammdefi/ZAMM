@@ -7,7 +7,7 @@ error InvalidMetadata();
 error DeploymentFailed();
 
 uint256 constant MAX_BPS = 10_000; // 100%
-address constant ZAMM = 0x000000000000040470635EB91b7CE4D132D616eD;
+address payable constant ZAMM = payable(0x000000000000040470635EB91b7CE4D132D616eD);
 
 /// @title zCoins (V0)
 /// @notice Singleton for ERC6909 & ERC20s with hooks
@@ -176,9 +176,7 @@ contract zCoins {
         enforceRecipient(id, to)
         returns (bool)
     {
-        if (msg.sender == ZAMM && from != address(this)) {
-            revert DisallowedRecipient();
-        }
+        if (msg.sender == ZAMM && from != address(this)) revert DisallowedRecipient();
 
         if (msg.sender != from) {
             if (msg.sender != ZAMM) {
@@ -191,6 +189,7 @@ contract zCoins {
                 }
             }
         }
+
         balanceOf[from][id] -= amount;
         unchecked {
             balanceOf[to][id] += amount;
@@ -255,7 +254,7 @@ contract zCoins {
     event RecipientAllowed(uint256 indexed id, address indexed to, bool allowed);
 
     mapping(uint256 id => uint256) public taxBps;
-    mapping(uint256 => mapping(address => bool)) public isAllowedRecipient;
+    mapping(uint256 id => mapping(address recipient => bool)) public isAllowedRecipient;
 
     error InvalidMsgVal();
     error InvalidPoolKey();
@@ -385,7 +384,7 @@ contract zCoins {
     └───────────────────────────────────────────────────────────────*/
 
     function addLiquidity(uint256 id, uint256 amountCoinDesired, uint256 deadline)
-        external
+        public
         payable
         lock
         returns (uint256 ethUsed, uint256 coinUsed, uint256 liquidity)
@@ -429,7 +428,7 @@ contract zCoins {
         uint256 amountEthMin,
         uint256 amountCoinMin,
         uint256 deadline
-    ) external lock returns (uint256 ethOut, uint256 coinOut) {
+    ) public lock returns (uint256 ethOut, uint256 coinOut) {
         require(liquidity != 0, Unauthorized());
 
         uint256 hook = (1 << 255) | id;
@@ -443,7 +442,7 @@ contract zCoins {
             uint256(keccak256(abi.encode(uint256(0), id, address(0), address(this), hook)));
 
         /* pull LP tokens into zCoins so ZAMM can burn them */
-        ZERC6909(ZAMM).transferFrom(msg.sender, address(this), poolId, liquidity);
+        zCoins(ZAMM).transferFrom(msg.sender, address(this), poolId, liquidity);
 
         /* remove liquidity, send proceeds directly to the user */
         (ethOut, coinOut) = IZAMM(ZAMM).removeLiquidity(
@@ -534,6 +533,15 @@ interface IZAMM {
         address to,
         uint256 deadline
     ) external payable returns (uint256 amount0, uint256 amount1, uint256 liquidity);
+
+    function removeLiquidity(
+        PoolKey calldata poolKey,
+        uint256 liquidity,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amount0, uint256 amount1);
 }
 
 contract zToken {
@@ -601,6 +609,7 @@ contract zToken {
         bytes calldata /*data*/
     ) public view returns (uint256 feeBps) {
         require(sender == zc, Unauthorized());
-        return swapFee;
+        uint256 _swapFee = swapFee;
+        return _swapFee == 0 ? 30 : _swapFee;
     }
 }
