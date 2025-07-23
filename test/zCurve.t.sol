@@ -28,7 +28,7 @@ contract ZCurveTest is Test {
     /* helper ---------------------------------------------------------- */
     function _launch(uint96 cap) internal returns (uint256 id) {
         /* duplicate LP tranche == saleCap for simplicity */
-        id = curve.launchFT(0, 0, cap, cap, "uri", TARGET, DIV);
+        id = curve.launch(0, 0, cap, cap, "uri", TARGET, DIV);
     }
 
     /* -----------------------------------------------------------------
@@ -37,7 +37,7 @@ contract ZCurveTest is Test {
     function testLaunchValues() public {
         uint96 cap = 1_000;
         uint96 lpDup = cap;
-        uint256 coinId = curve.launchFT(0, 0, cap, lpDup, "uri", TARGET, DIV);
+        uint256 coinId = curve.launch(0, 0, cap, lpDup, "uri", TARGET, DIV);
 
         (
             address c,
@@ -112,7 +112,7 @@ contract ZCurveTest is Test {
     ------------------------------------------------------------------*/
     function testSellForExactEth() public {
         uint96 saleCap = 500;
-        uint256 coinId = curve.launchFT(0, 0, saleCap, saleCap, "uri", 10 ether, DIV);
+        uint256 coinId = curve.launch(0, 0, saleCap, saleCap, "uri", 10 ether, DIV);
 
         uint96 initialBuy = 300;
         uint256 buyCost = curve.buyCost(coinId, initialBuy);
@@ -170,7 +170,7 @@ contract ZCurveTest is Test {
     ------------------------------------------------------------------*/
     function testManualFinalizeAfterDeadline() public {
         uint96 cap = 1_000;
-        uint256 coinId = curve.launchFT(0, 0, cap, cap, "uri", 3 ether, DIV);
+        uint256 coinId = curve.launch(0, 0, cap, cap, "uri", 3 ether, DIV);
 
         uint96 buyAmt = 180;
         uint256 cost = curve.buyCost(coinId, buyAmt);
@@ -265,7 +265,7 @@ contract ZCurveTest is Test {
        FINAL. full life‑cycle: launch → buy → finalise → claim
     ------------------------------------------------------------------*/
     function testFullLifecycleClaim() public {
-        uint256 coinId = curve.launchFT(0, 0, 1_000, 1_000, "uri", 3 ether, DIV);
+        uint256 coinId = curve.launch(0, 0, 1_000, 1_000, "uri", 3 ether, DIV);
 
         /* mocks */
         vm.mockCall(
@@ -302,7 +302,7 @@ contract ZCurveTest is Test {
         uint96 saleCap = 800; // 80 %
         uint96 lpSupply = 200; // 20 %
 
-        uint256 coinId = curve.launchFT(
+        uint256 coinId = curve.launch(
             0, // creatorSupply
             0,
             saleCap,

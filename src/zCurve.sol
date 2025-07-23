@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
-/*───────────────────────────  zCurve  ──────────────────────────*/
 contract zCurve {
-    /* ───────── external constants ───────── */
     IZAMM constant Z = IZAMM(0x000000000000040470635EB91b7CE4D132D616eD);
 
     /* ───────── launchpad constants ──────── */
@@ -20,7 +18,7 @@ contract zCurve {
         uint56 deadline;
         /* slot‑1 */
         uint96 saleCap;
-        uint96 lpSupply; // <── new explicit LP tranche
+        uint96 lpSupply;
         uint128 ethEscrow;
         /* slot‑2 */
         uint128 netSold;
@@ -67,7 +65,7 @@ contract zCurve {
     error InvalidParams();
     error OverflowTotalSupply();
 
-    function launchFT(
+    function launch(
         uint96 creatorSupply,
         uint256 creatorUnlock,
         uint96 saleCap,
@@ -113,10 +111,10 @@ contract zCurve {
     /* =================================================================== *
                                     BUY
     * =================================================================== */
+    error InvalidMsgVal();
     error Finalized();
     error TooLate();
     error SoldOut();
-    error InvalidMsgVal();
 
     function buyForExactEth(uint256 coinId, uint96 minCoins)
         external
@@ -208,6 +206,7 @@ contract zCurve {
         if (desiredEthOut == 0) revert InvalidMsgVal();
         Sale storage S = sales[coinId];
         if (S.creator == address(0)) revert Finalized();
+        if (S.netSold == 0) revert InsufficientEscrow();
 
         uint96 div = S.divisor;
 
@@ -231,6 +230,7 @@ contract zCurve {
         Sale storage S = sales[coinId];
         uint128 bal = balances[coinId][msg.sender];
         if (bal < coins) revert InsufficientBalance();
+        if (S.creator == address(0)) revert Finalized();
 
         refund = _cost(S.netSold, S.divisor) - _cost(S.netSold - coins, S.divisor);
         if (refund > S.ethEscrow) revert InsufficientEscrow();
@@ -271,7 +271,7 @@ contract zCurve {
         emit Claim(msg.sender, coinId, coins);
     }
 
-    /* ---------- internal finalise ---------- */
+    /* ---------- internal finalize ---------- */
     function _finalize(Sale storage S, uint256 coinId) private {
         uint256 coinAmt = S.lpSupply;
         if (Z.balanceOf(address(this), coinId) < coinAmt) revert LPBalanceMismatch();
@@ -303,10 +303,31 @@ contract zCurve {
         emit Finalize(coinId, ethAmt, coinAmt, lp);
     }
 
-    /* ------------ quadratic cost ------------ */
-    function _cost(uint256 n, uint256 d) private pure returns (uint256) {
+    /*─────────────────────  Bonding‑curve cost helper  ──────────────────────*
+    |  Spot price  p(k) = k² / d   (in wei)                                    |
+    |  Integral    Σₖ₌₀^{n‑1} k² = n(n‑1)(2n‑1) / 6                            |
+    |                                                                          |
+    |  Therefore:                                                              |
+    |      cost(n,d) = n(n‑1)(2n‑1) · 1 ether / (6·d)                          |
+    |                                                                          |
+    |  ‣  Tokens 0 and 1 cost zero ⇒ early‑return n < 2.                       |
+    |  ‣  `fullMulDiv()` is used once (at the end) to evaluate the             |
+    |     512‑bit numerator exactly and divide by 6·d without overflow.        |
+    |                                                                          |
+    |  NOTE: With the default uint96 supply cap, the unchecked multiplication  |
+    |        `n*(n‑1)*(2n‑1)` cannot overflow a uint256, but using             |
+    |        `fullMulDiv` on the final step guarantees safety if those caps    |
+    |        are ever raised.                                                  |
+    *──────────────────────────────────────────────────────────────────────────*/
+    function _cost(uint256 n, uint256 d) internal pure returns (uint256) {
+        if (n < 2) return 0; // first two tokens are free
+
         unchecked {
-            return n * (n - 1) * (2 * n - 1) * 1 ether / (6 * d);
+            // Cubic numerator (fits in 256 bits for uint96‑bounded n).
+            uint256 num = n * (n - 1) * (2 * n - 1);
+
+            // Single 512‑bit mul‑div to scale by 1 ether and divide by 6·d.
+            return fullMulDiv(num, 1 ether, 6 * d);
         }
     }
 
@@ -352,7 +373,6 @@ contract zCurve {
     }
 }
 
-/*────────────────────────  ZAMM interface  ─────────────────────────*/
 interface IZAMM {
     struct PoolKey {
         uint256 id0;
@@ -362,26 +382,76 @@ interface IZAMM {
         uint256 feeOrHook;
     }
 
-    function coin(address, uint256, string calldata) external returns (uint256);
-    function transfer(address, uint256, uint256) external returns (bool);
-    function lockup(address, address, uint256, uint256, uint256)
+    function addLiquidity(
+        PoolKey calldata poolKey,
+        uint256 amount0Desired,
+        uint256 amount1Desired,
+        uint256 amount0Min,
+        uint256 amount1Min,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256 amount0, uint256 amount1, uint256 liquidity);
+
+    function lockup(address token, address to, uint256 id, uint256 amount, uint256 unlockTime)
         external
         payable
-        returns (bytes32);
-    function deposit(address, uint256, uint256) external payable;
-    function balanceOf(address, uint256) external view returns (uint256);
-    function addLiquidity(PoolKey calldata, uint256, uint256, uint256, uint256, address, uint256)
+        returns (bytes32 lockHash);
+
+    function coin(address creator, uint256 supply, string calldata uri)
         external
-        payable
-        returns (uint256, uint256, uint256);
+        returns (uint256 coinId);
+    function transfer(address to, uint256 id, uint256 amount) external returns (bool);
+    function balanceOf(address user, uint256 id) external returns (uint256);
 }
 
-/*──── minimal ETH helper ────*/
-function safeTransferETH(address to, uint256 amt) {
-    assembly {
-        if iszero(call(gas(), to, amt, 0, 0, 0, 0)) {
-            mstore(0, 0xb12d13eb)
-            revert(28, 4)
+// Modified from Solady (https://github.com/Vectorized/solady/blob/main/src/utils/FixedPointMathLib.sol)
+
+error FullMulDivFailed();
+
+function fullMulDiv(uint256 x, uint256 y, uint256 d) pure returns (uint256 z) {
+    assembly ("memory-safe") {
+        z := mul(x, y)
+        for {} 1 {} {
+            if iszero(mul(or(iszero(x), eq(div(z, x), y)), d)) {
+                let mm := mulmod(x, y, not(0))
+                let p1 := sub(mm, add(z, lt(mm, z)))
+
+                let r := mulmod(x, y, d)
+                let t := and(d, sub(0, d))
+
+                if iszero(gt(d, p1)) {
+                    mstore(0x00, 0xae47f702)
+                    revert(0x1c, 0x04)
+                }
+                d := div(d, t)
+                let inv := xor(2, mul(3, d))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                z :=
+                    mul(
+                        or(mul(sub(p1, gt(r, z)), add(div(sub(0, t), t), 1)), div(sub(z, r), t)),
+                        mul(sub(2, mul(d, inv)), inv)
+                    )
+                break
+            }
+            z := div(z, d)
+            break
+        }
+    }
+}
+
+// Modified from Solady (https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol)
+
+error ETHTransferFailed();
+
+function safeTransferETH(address to, uint256 amount) {
+    assembly ("memory-safe") {
+        if iszero(call(gas(), to, amount, codesize(), 0x00, codesize(), 0x00)) {
+            mstore(0x00, 0xb12d13eb)
+            revert(0x1c, 0x04)
         }
     }
 }
