@@ -7,8 +7,7 @@ contract zCurve {
     /* ───────── launchpad constants ──────── */
 
     uint256 constant DEFAULT_FEE_BPS = 30;
-    uint256 constant SALE_DURATION = 1 weeks;
-    uint256 constant MIN_ETH_RAISE = 1 ether;
+    uint256 constant SALE_DURATION = 2 weeks;
 
     /* ───────── storage (4 packed slots) ───────── */
 
@@ -150,6 +149,7 @@ contract zCurve {
         lock
         returns (uint96 coinsOut, uint256 ethCost)
     {
+        require(msg.value != 0, InvalidMsgVal());
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
@@ -227,6 +227,7 @@ contract zCurve {
         lock
         returns (uint256 refundWei)
     {
+        require(coins != 0, NoWant());
         Sale storage S = sales[coinId];
         require(S.creator != address(0), Finalized());
 
@@ -291,8 +292,7 @@ contract zCurve {
         Sale storage S = sales[coinId];
         require(S.creator != address(0), Finalized());
 
-        bool timeGate = block.timestamp >= S.deadline && S.ethEscrow >= MIN_ETH_RAISE;
-        if (!timeGate && S.ethEscrow < S.ethTarget) revert Pending();
+        require(block.timestamp > S.deadline, Pending());
 
         _finalize(S, coinId);
     }
@@ -308,8 +308,19 @@ contract zCurve {
 
     /* ---------- internal finalize ---------- */
     function _finalize(Sale storage S, uint256 coinId) internal {
-        uint256 coinAmt = S.lpSupply;
         uint256 ethAmt = S.ethEscrow;
+        uint256 coinAmt = S.lpSupply;
+
+        // If any portion of the sale remains unsold,
+        // scale LP tranche to match spot price:
+        if (S.netSold != S.saleCap) {
+            uint256 k = S.netSold;
+            // Marginal spot price at boundary: wei per token (18-dec)
+            uint256 p = _cost(k + 1, S.divisor) - _cost(k, S.divisor);
+            uint256 scaled = ethAmt / p; // rounds down
+            if (scaled < coinAmt) coinAmt = scaled; // cap at lpSupply
+                // (If scaled >= lpSupply, we just keep full lpSupply)
+        }
 
         delete sales[coinId];
 
@@ -337,13 +348,12 @@ contract zCurve {
     ///      First two tokens are free (n < 2).
     function _cost(uint256 n, uint256 d) internal pure returns (uint256) {
         if (n < 2) return 0;
-        // Use fullMulDiv for *every* potentially overflowing multiply:
         unchecked {
-            // Step 1: A = n * (n - 1)
+            // 1) A = n * (n - 1)
             uint256 A = fullMulDiv(n, n - 1, 1);
-            // Step 2: B = A * (2n - 1)
+            // 2) B = A * (2n - 1)
             uint256 B = fullMulDiv(A, 2 * n - 1, 1);
-            // Step 3: scale by 1e18 and divide by 6*d
+            // 3) Scale and divide
             return fullMulDiv(B, 1 ether, 6 * d);
         }
     }
@@ -352,23 +362,29 @@ contract zCurve {
 
     function buyCost(uint256 coinId, uint96 coins) public view returns (uint256) {
         Sale storage S = sales[coinId];
+        if (S.creator == address(0)) return 0;
         return _cost(S.netSold + coins, S.divisor) - _cost(S.netSold, S.divisor);
     }
 
     function sellRefund(uint256 coinId, uint96 coins) public view returns (uint256) {
         Sale storage S = sales[coinId];
+        if (coins > S.netSold) return 0;
+        if (S.creator == address(0)) return 0;
         return _cost(S.netSold, S.divisor) - _cost(S.netSold - coins, S.divisor);
     }
 
     function tokensForEth(uint256 coinId, uint256 weiIn) public view returns (uint96) {
         Sale storage S = sales[coinId];
+        if (S.creator == address(0)) return 0;
         uint256 div = S.divisor;
 
         uint96 lo;
-        uint96 hi = uint96(S.saleCap - S.netSold);
+        uint96 mid;
+        uint96 hi = S.saleCap - S.netSold;
+        uint256 cost;
         while (lo < hi) {
-            uint96 mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
-            uint256 cost = _cost(S.netSold + mid, div) - _cost(S.netSold, div);
+            mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
+            cost = _cost(S.netSold + mid, div) - _cost(S.netSold, div);
             if (cost <= weiIn) lo = mid;
             else hi = mid - 1;
         }
@@ -377,13 +393,16 @@ contract zCurve {
 
     function tokensToBurnForEth(uint256 coinId, uint256 weiOut) public view returns (uint96) {
         Sale storage S = sales[coinId];
+        if (S.creator == address(0) || S.netSold == 0) return 0;
         uint256 div = S.divisor;
 
         uint96 lo = 1;
-        uint96 hi = uint96(S.netSold);
+        uint96 mid;
+        uint96 hi = S.netSold;
+        uint256 refund;
         while (lo < hi) {
-            uint96 mid = uint96((uint256(lo) + uint256(hi)) >> 1);
-            uint256 refund = _cost(S.netSold, div) - _cost(S.netSold - mid, div);
+            mid = uint96((uint256(lo) + uint256(hi)) >> 1);
+            refund = _cost(S.netSold, div) - _cost(S.netSold - mid, div);
             if (refund >= weiOut) hi = mid;
             else lo = mid + 1;
         }

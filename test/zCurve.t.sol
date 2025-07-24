@@ -175,7 +175,7 @@ contract ZCurveTest is Test {
         vm.prank(userB);
         curve.buyExactCoins{value: cost}(coinId, buyAmt);
 
-        vm.warp(block.timestamp + 1 weeks + 1);
+        vm.warp(block.timestamp + 2 weeks + 1);
 
         /* mocks */
         vm.mockCall(
@@ -283,7 +283,7 @@ contract ZCurveTest is Test {
         vm.prank(userA);
         curve.buyExactCoins{value: cost}(coinId, buyAmt);
 
-        vm.warp(block.timestamp + 1 weeks + 1);
+        vm.warp(block.timestamp + 2 weeks + 1);
         curve.finalize(coinId);
 
         uint96 bal = curve.balances(coinId, userA);
