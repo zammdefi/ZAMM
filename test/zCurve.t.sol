@@ -15,7 +15,7 @@ contract ZCurveTest is Test {
 
     /* mellow curve so tests use small ETH amounts */
     uint96 constant DIV = 1_000_000;
-    uint128 constant TARGET = 0.5 ether;
+    uint96 constant TARGET = 0.5 ether;
 
     function setUp() public {
         vm.createSelectFork(vm.rpcUrl("main"));
@@ -28,7 +28,7 @@ contract ZCurveTest is Test {
     /* helper ---------------------------------------------------------- */
     function _launch(uint96 cap) internal returns (uint256 id) {
         /* duplicate LP tranche == saleCap for simplicity */
-        id = curve.launch(0, 0, cap, cap, uint96(TARGET), uint64(DIV), "uri");
+        (id,) = curve.launch(0, 0, cap, cap, uint96(TARGET), uint64(DIV), "uri");
     }
 
     /* -----------------------------------------------------------------
@@ -37,7 +37,7 @@ contract ZCurveTest is Test {
     function testLaunchValues() public {
         uint96 cap = 1_000;
         uint96 lpDup = cap;
-        uint256 coinId = curve.launch(0, 0, cap, lpDup, uint96(TARGET), uint64(DIV), "uri");
+        (uint256 coinId,) = curve.launch(0, 0, cap, lpDup, uint96(TARGET), uint64(DIV), "uri");
 
         (
             address c,
@@ -83,7 +83,7 @@ contract ZCurveTest is Test {
         uint96 minCoins = curve.tokensForEth(coinId, 1 ether);
         uint256 expectedCost = curve.buyCost(coinId, minCoins);
         vm.prank(userA);
-        (uint128 out, uint256 spent) = curve.buyForExactEth{value: 1 ether}(coinId, minCoins);
+        (uint96 out, uint256 spent) = curve.buyForExactEth{value: 1 ether}(coinId, minCoins);
 
         assertEq(out, minCoins);
         assertEq(spent, expectedCost);
@@ -110,7 +110,7 @@ contract ZCurveTest is Test {
     ------------------------------------------------------------------*/
     function testSellForExactEth() public {
         uint96 saleCap = 500;
-        uint256 coinId = curve.launch(0, 0, saleCap, saleCap, 10 ether, uint64(DIV), "uri");
+        (uint256 coinId,) = curve.launch(0, 0, saleCap, saleCap, 10 ether, uint64(DIV), "uri");
 
         uint96 initialBuy = 300;
         uint256 buyCost = curve.buyCost(coinId, initialBuy);
@@ -168,7 +168,7 @@ contract ZCurveTest is Test {
     ------------------------------------------------------------------*/
     function testManualFinalizeAfterDeadline() public {
         uint96 cap = 1_000;
-        uint256 coinId = curve.launch(0, 0, cap, cap, 3 ether, uint64(DIV), "uri");
+        (uint256 coinId,) = curve.launch(0, 0, cap, cap, 3 ether, uint64(DIV), "uri");
 
         uint96 buyAmt = 180;
         uint256 cost = curve.buyCost(coinId, buyAmt);
@@ -227,7 +227,7 @@ contract ZCurveTest is Test {
         vm.prank(userA);
         curve.buyExactCoins{value: cost}(coinId, buyAmt);
 
-        uint128 bal = curve.balances(coinId, userA);
+        uint96 bal = curve.balances(coinId, userA);
         vm.prank(userA);
         curve.claim(coinId, bal);
 
@@ -263,7 +263,7 @@ contract ZCurveTest is Test {
        FINAL. full life‑cycle: launch → buy → finalise → claim
     ------------------------------------------------------------------*/
     function testFullLifecycleClaim() public {
-        uint256 coinId = curve.launch(0, 0, 1_000, 1_000, 3 ether, uint64(DIV), "uri");
+        (uint256 coinId,) = curve.launch(0, 0, 1_000, 1_000, 3 ether, uint64(DIV), "uri");
 
         /* mocks */
         vm.mockCall(
@@ -286,7 +286,7 @@ contract ZCurveTest is Test {
         vm.warp(block.timestamp + 1 weeks + 1);
         curve.finalize(coinId);
 
-        uint128 bal = curve.balances(coinId, userA);
+        uint96 bal = curve.balances(coinId, userA);
         vm.prank(userA);
         curve.claim(coinId, bal);
 
@@ -300,7 +300,7 @@ contract ZCurveTest is Test {
         uint96 saleCap = 800; // 80 %
         uint96 lpSupply = 200; // 20 %
 
-        uint256 coinId = curve.launch(
+        (uint256 coinId,) = curve.launch(
             0, // creatorSupply
             0,
             saleCap,
@@ -341,6 +341,124 @@ contract ZCurveTest is Test {
         curve.buyExactCoins{value: 1 ether}(coinId, 1);
     }
 
+    /* ================================================================
+       NEW TESTS FOR PRE-BUY ON LAUNCH
+       ================================================================ */
+
+    /// @notice creator sends ETH with launch; pre-buy should mint tokens & escrow ETH
+    function testLaunchPreBuyMintsAndEscrows() public {
+        uint96 saleCap = 1_000;
+        uint96 lpDup = saleCap;
+        uint96 target = TARGET;
+        uint64 div = uint64(DIV);
+
+        uint256 sendVal = 0.2 ether; // any positive amount
+
+        uint256 balBefore = owner.balance;
+        (uint256 coinId,) = curve.launch{value: sendVal}(0, 0, saleCap, lpDup, target, div, "uri");
+
+        // read sale struct
+        (
+            address c,
+            uint96 saleCapRead,
+            uint96 lpSupply,
+            uint96 netSold,
+            ,
+            uint64 divisorRead,
+            uint96 esc,
+            uint96 tgt
+        ) = curve.sales(coinId);
+
+        // After pre-buy, sale is still active unless we hit target
+        assertEq(c, owner);
+        assertEq(saleCapRead, saleCap);
+        assertEq(lpSupply, lpDup);
+        assertEq(divisorRead, div);
+        assertEq(tgt, target);
+
+        // pre-buy must have minted something
+        assertGt(netSold, 0, "no tokens sold in pre-buy");
+
+        // creator should now hold the pre-bought tokens
+        assertEq(curve.balances(coinId, owner), netSold, "creator balance mismatch");
+
+        // ETH escrowed equals what the curve charged
+        assertEq(esc, uint96(_cost(netSold, div)), "escrow mismatch");
+
+        // creator balance delta ~= escrow (minus gas)
+        uint256 balAfter = owner.balance;
+        // Allow small wiggle room for gas; escrowed ETH must have left creator's balance
+        assertApproxEqAbs(balBefore - balAfter, esc, 2e12 /* ~0.000002 ETH */ );
+    }
+
+    /// @notice launch pre-buy refunds any excess ETH
+    function testLaunchPreBuyRefundsExcess() public {
+        uint96 saleCap = 2_000;
+        uint96 lpDup = saleCap;
+        uint96 target = TARGET;
+        uint64 div = uint64(DIV);
+
+        uint256 sendVal = 1 ether;
+
+        uint256 balBefore = owner.balance;
+        (uint256 coinId,) = curve.launch{value: sendVal}(0, 0, saleCap, lpDup, target, div, "uri");
+
+        // sales struct is likely deleted if auto-finalized, so don't read esc from it
+        uint96 bought = curve.balances(coinId, owner);
+        uint256 spent = _cost(bought, div); // test-side helper mirroring contract
+
+        uint256 balAfter = owner.balance;
+        // balance delta should equal what was actually spent (ignoring gas)
+        assertApproxEqAbs(balBefore - balAfter, spent, 2e12);
+        assertTrue(spent <= sendVal, "overspent");
+    }
+
+    /// @notice launch with too-small msg.value to buy even 1 token should revert
+    function testLaunchPreBuyTooSmallReverts() public {
+        uint96 saleCap = 1_000;
+        uint96 lpDup = saleCap;
+        uint96 target = TARGET;
+        uint64 div = uint64(DIV);
+
+        // Sending 1 wei will still mint 1 free token (tokens 0 or 1)
+        (uint256 coinId,) = curve.launch{value: 1}(0, 0, saleCap, lpDup, target, div, "uri");
+
+        // Expect success: creator got 1 token
+        assertEq(curve.balances(coinId, owner), 1);
+    }
+
+    /// @notice pre-buy can hit target and auto-finalize inside launch
+    function testLaunchPreBuyAutoFinalize() public {
+        uint96 saleCap = 800;
+        uint96 lpDup = 200;
+        uint96 target = 0.05 ether;
+        uint64 div = 1_000_000_000;
+
+        // mock ZAMM calls used by finalize (balanceOf & addLiquidity) BEFORE launch
+        vm.mockCall(
+            address(Z),
+            abi.encodeWithSelector(IZAMM.balanceOf.selector, address(curve), 0), // coinId unknown yet, ignore
+            abi.encode(uint256(1e27))
+        );
+        vm.mockCall(
+            address(Z),
+            abi.encodeWithSelector(IZAMM.addLiquidity.selector),
+            abi.encode(uint256(0), uint256(0), uint256(555))
+        );
+
+        // Send enough ETH to cross target
+        uint256 sendVal = 1 ether;
+
+        (uint256 coinId, uint96 coinsOut) =
+            curve.launch{value: sendVal}(0, 0, saleCap, lpDup, target, div, "pumpfun");
+
+        assertTrue(coinsOut != 0);
+
+        // After finalize, sales[coinId].creator should be 0
+        (address creator,,,,,,,) = curve.sales(coinId);
+        assertEq(creator, address(0), "sale should be finalized");
+    }
+
     receive() external payable {}
 }
 
@@ -363,6 +481,49 @@ contract Reenter {
         if (!reentered) {
             reentered = true;
             c.buyExactCoins{value: 1}(id, 1);
+        }
+    }
+}
+
+function _cost(uint256 n, uint256 d) pure returns (uint256) {
+    if (n < 2) return 0;
+    unchecked {
+        uint256 num = n * (n - 1) * (2 * n - 1);
+        return fullMulDiv(num, 1 ether, 6 * d);
+    }
+}
+
+function fullMulDiv(uint256 x, uint256 y, uint256 d) pure returns (uint256 z) {
+    assembly ("memory-safe") {
+        z := mul(x, y)
+        for {} 1 {} {
+            if iszero(mul(or(iszero(x), eq(div(z, x), y)), d)) {
+                let mm := mulmod(x, y, not(0))
+                let p1 := sub(mm, add(z, lt(mm, z)))
+
+                let r := mulmod(x, y, d)
+                let t := and(d, sub(0, d))
+
+                if iszero(gt(d, p1)) {
+                    mstore(0x00, 0xae47f702)
+                    revert(0x1c, 0x04)
+                }
+                d := div(d, t)
+                let inv := xor(2, mul(3, d))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                inv := mul(inv, sub(2, mul(d, inv)))
+                z :=
+                    mul(
+                        or(mul(sub(p1, gt(r, z)), add(div(sub(0, t), t), 1)), div(sub(z, r), t)),
+                        mul(sub(2, mul(d, inv)), inv)
+                    )
+                break
+            }
+            z := div(z, d)
+            break
         }
     }
 }

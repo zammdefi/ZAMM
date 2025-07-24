@@ -18,30 +18,33 @@ contract zCurve {
     */
 
     struct Sale {
-        address creator; // 160 bits
-        uint96 saleCap; //  96 bits
-        uint96 lpSupply; //  96 bits
-        uint96 netSold; //  96 bits
-        uint64 deadline; //  64 bits
-        uint64 divisor; //  64 bits
-        uint96 ethEscrow; //  96 bits
-        uint96 ethTarget; //  96 bits
+        address creator;
+        uint96 saleCap;
+        uint96 lpSupply;
+        uint96 netSold;
+        uint64 deadline;
+        uint64 divisor;
+        uint96 ethEscrow;
+        uint96 ethTarget;
     }
 
     mapping(uint256 => Sale) public sales;
-    mapping(uint256 => mapping(address => uint128)) public balances;
+    mapping(uint256 => mapping(address => uint96)) public balances;
 
     /* ───────── guard ───────── */
+    // Soledge (https://github.com/Vectorized/soledge/blob/main/src/utils/ReentrancyGuard.sol)
+    error Reentrancy();
+
     modifier lock() {
-        assembly {
+        assembly ("memory-safe") {
             if tload(0x929eee149b4bd21268) {
-                mstore(0, 0xab143c06)
-                revert(28, 4)
+                mstore(0x00, 0xab143c06) // `Reentrancy()`
+                revert(0x1c, 0x04)
             }
-            tstore(0x929eee149b4bd21268, caller())
+            tstore(0x929eee149b4bd21268, address())
         }
         _;
-        assembly {
+        assembly ("memory-safe") {
             tstore(0x929eee149b4bd21268, 0)
         }
     }
@@ -56,10 +59,10 @@ contract zCurve {
         uint96 target,
         uint64 divisor
     );
-    event Buy(address indexed buyer, uint256 indexed coinId, uint256 ethIn, uint128 coinsOut);
-    event Sell(address indexed seller, uint256 indexed coinId, uint128 coinsIn, uint256 ethOut);
+    event Buy(address indexed buyer, uint256 indexed coinId, uint256 ethIn, uint96 coinsOut);
+    event Sell(address indexed seller, uint256 indexed coinId, uint96 coinsIn, uint256 ethOut);
     event Finalize(uint256 indexed coinId, uint256 ethLp, uint256 coinLp, uint256 lpMinted);
-    event Claim(address indexed user, uint256 indexed coinId, uint256 amount);
+    event Claim(address indexed user, uint256 indexed coinId, uint96 amount);
 
     /* =================================================================== *
                                    LAUNCH
@@ -76,12 +79,12 @@ contract zCurve {
         uint96 ethTargetWei,
         uint64 divisor,
         string calldata uri
-    ) public returns (uint256 coinId) {
+    ) public payable lock returns (uint256 coinId, uint96 coinsOut) {
         require(saleCap != 0 && lpSupply != 0 && ethTargetWei != 0 && divisor != 0, InvalidParams());
 
         /* total minted = creator + sale tranche + LP tranche */
         uint256 totalMint = creatorSupply + saleCap + lpSupply;
-        if (totalMint > type(uint96).max) revert OverflowTotalSupply();
+        require(totalMint <= type(uint96).max, OverflowTotalSupply());
 
         coinId = Z.coin(address(this), totalMint, uri);
 
@@ -96,15 +99,42 @@ contract zCurve {
             }
         }
 
+        Sale storage S = sales[coinId];
+
         /* record sale */
         unchecked {
-            Sale storage S = sales[coinId];
             S.creator = msg.sender;
             S.saleCap = saleCap;
             S.lpSupply = lpSupply;
             S.deadline = uint64(block.timestamp + SALE_DURATION);
             S.divisor = divisor;
             S.ethTarget = ethTargetWei;
+        }
+
+        // netSold is guaranteed 0 at launch, so _cost(0, d) == 0, and
+        // we can skip the subtraction and call _cost(mid, d) directly
+        if (msg.value != 0) {
+            uint96 lo;
+            uint96 mid;
+            uint96 hi = saleCap;
+            uint256 cost;
+
+            while (lo < hi) {
+                mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
+                cost = _cost(mid, divisor);
+                if (cost <= msg.value) lo = mid;
+                else hi = mid - 1;
+            }
+
+            coinsOut = lo;
+            require(coinsOut != 0, InvalidMsgVal());
+
+            uint256 ethCost = _cost(coinsOut, divisor);
+            _mintToBuyer(S, coinId, coinsOut, ethCost);
+
+            if (msg.value > ethCost) {
+                safeTransferETH(msg.sender, msg.value - ethCost);
+            }
         }
 
         emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
@@ -123,56 +153,60 @@ contract zCurve {
         public
         payable
         lock
-        returns (uint128 coinsOut, uint256 ethCost)
+        returns (uint96 coinsOut, uint256 ethCost)
     {
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
         uint64 div = S.divisor;
-        uint96 left = S.saleCap - uint96(S.netSold);
-
         uint96 lo;
-        uint96 hi = left;
+        uint96 mid;
+        uint96 hi = S.saleCap - S.netSold;
+        uint256 cost;
+
         while (lo < hi) {
-            uint96 mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
-            uint256 cost = _cost(S.netSold + mid, div) - _cost(S.netSold, div);
+            mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
+            cost = _cost(S.netSold + mid, div) - _cost(S.netSold, div);
             if (cost <= msg.value) lo = mid;
             else hi = mid - 1;
         }
+
         coinsOut = lo;
-        if (coinsOut == 0 || coinsOut < minCoins) revert InvalidMsgVal();
+        require(coinsOut != 0 && coinsOut >= minCoins, InvalidMsgVal());
 
         ethCost = _cost(S.netSold + coinsOut, div) - _cost(S.netSold, div);
-        _mintToBuyer(S, coinId, uint96(coinsOut), ethCost);
+        _mintToBuyer(S, coinId, coinsOut, ethCost);
 
         if (msg.value > ethCost) safeTransferETH(msg.sender, msg.value - ethCost);
     }
+
+    error NoWant();
 
     function buyExactCoins(uint256 coinId, uint96 coinsWanted)
         public
         payable
         lock
-        returns (uint128)
+        returns (uint256 cost)
     {
-        if (coinsWanted == 0) revert InvalidMsgVal();
+        require(coinsWanted != 0, NoWant());
+
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
         if (S.netSold + coinsWanted > S.saleCap) revert SoldOut();
 
-        uint256 cost = _cost(S.netSold + coinsWanted, S.divisor) - _cost(S.netSold, S.divisor);
-        if (msg.value < cost) revert InvalidMsgVal();
+        cost = _cost(S.netSold + coinsWanted, S.divisor) - _cost(S.netSold, S.divisor);
+        require(msg.value >= cost, InvalidMsgVal());
 
         _mintToBuyer(S, coinId, coinsWanted, cost);
         if (msg.value > cost) safeTransferETH(msg.sender, msg.value - cost);
-        return coinsWanted;
     }
 
     /* ---------- shared buy helpers ---------- */
 
     function _preLiveCheck(Sale storage S) internal view {
-        if (S.creator == address(0)) revert Finalized();
-        if (block.timestamp > S.deadline) revert TooLate();
+        require(S.creator != address(0), Finalized());
+        require(block.timestamp <= S.deadline, TooLate());
     }
 
     function _mintToBuyer(Sale storage S, uint256 coinId, uint96 coins, uint256 cost) internal {
@@ -233,7 +267,7 @@ contract zCurve {
     /* ---------- core sell executor ---------- */
     function _executeSell(uint256 coinId, uint96 coins) internal returns (uint256 refund) {
         Sale storage S = sales[coinId];
-        uint128 bal = balances[coinId][msg.sender];
+        uint96 bal = balances[coinId][msg.sender];
         if (bal < coins) revert InsufficientBalance();
         if (S.creator == address(0)) revert Finalized();
 
@@ -267,9 +301,8 @@ contract zCurve {
         _finalize(S, coinId);
     }
 
-    function claim(uint256 coinId, uint128 coins) public lock {
-        if (coins == 0) revert InvalidMsgVal();
-        if (sales[coinId].creator != address(0)) revert Pending();
+    function claim(uint256 coinId, uint96 coins) public {
+        require(sales[coinId].creator == address(0), Pending());
 
         balances[coinId][msg.sender] -= coins;
         Z.transfer(msg.sender, coinId, coins);
