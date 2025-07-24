@@ -4,6 +4,10 @@ pragma solidity ^0.8.20;
 import "forge-std/Test.sol";
 import {zCurve, IZAMM} from "../src/zCurve.sol";
 
+interface IERC6909 {
+    function balanceOf(address, uint256) external view returns (uint256);
+}
+
 IZAMM constant Z = IZAMM(0x000000000000040470635EB91b7CE4D132D616eD);
 
 contract ZCurveTest is Test {
@@ -145,7 +149,7 @@ contract ZCurveTest is Test {
         /* mock balanceOf & addLiquidity */
         vm.mockCall(
             address(Z),
-            abi.encodeWithSelector(IZAMM.balanceOf.selector, address(curve), coinId),
+            abi.encodeWithSelector(IERC6909.balanceOf.selector, address(curve), coinId),
             abi.encode(uint256(1e27))
         );
         vm.mockCall(
@@ -180,7 +184,7 @@ contract ZCurveTest is Test {
         /* mocks */
         vm.mockCall(
             address(Z),
-            abi.encodeWithSelector(IZAMM.balanceOf.selector, address(curve), coinId),
+            abi.encodeWithSelector(IERC6909.balanceOf.selector, address(curve), coinId),
             abi.encode(uint256(1e27))
         );
         vm.mockCall(
@@ -212,7 +216,7 @@ contract ZCurveTest is Test {
         /* mocks */
         vm.mockCall(
             address(Z),
-            abi.encodeWithSelector(IZAMM.balanceOf.selector, address(curve), coinId),
+            abi.encodeWithSelector(IERC6909.balanceOf.selector, address(curve), coinId),
             abi.encode(uint256(1e27))
         );
         vm.mockCall(
@@ -268,7 +272,7 @@ contract ZCurveTest is Test {
         /* mocks */
         vm.mockCall(
             address(Z),
-            abi.encodeWithSelector(IZAMM.balanceOf.selector, address(curve), coinId),
+            abi.encodeWithSelector(IERC6909.balanceOf.selector, address(curve), coinId),
             abi.encode(uint256(1e27))
         );
         vm.mockCall(
@@ -437,7 +441,7 @@ contract ZCurveTest is Test {
         // mock ZAMM calls used by finalize (balanceOf & addLiquidity) BEFORE launch
         vm.mockCall(
             address(Z),
-            abi.encodeWithSelector(IZAMM.balanceOf.selector, address(curve), 0), // coinId unknown yet, ignore
+            abi.encodeWithSelector(IERC6909.balanceOf.selector, address(curve), 0), // coinId unknown yet, ignore
             abi.encode(uint256(1e27))
         );
         vm.mockCall(

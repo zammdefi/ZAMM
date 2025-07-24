@@ -140,6 +140,7 @@ contract zCurve {
                                     BUY
     * =================================================================== */
 
+    error NoWant();
     error SoldOut();
     error TooLate();
     error Finalized();
@@ -176,8 +177,6 @@ contract zCurve {
 
         if (msg.value > ethCost) safeTransferETH(msg.sender, msg.value - ethCost);
     }
-
-    error NoWant();
 
     function buyExactCoins(uint256 coinId, uint96 coinsWanted)
         public
@@ -444,7 +443,6 @@ interface IZAMM {
         external
         returns (uint256 coinId);
     function transfer(address to, uint256 id, uint256 amount) external returns (bool);
-    function balanceOf(address user, uint256 id) external returns (uint256);
 }
 
 // Modified from Solady (https://github.com/Vectorized/solady/blob/main/src/utils/FixedPointMathLib.sol)
