@@ -5,26 +5,27 @@ contract zCurve {
     IZAMM constant Z = IZAMM(0x000000000000040470635EB91b7CE4D132D616eD);
 
     /* ───────── launchpad constants ──────── */
-    uint56 constant SALE_DURATION = 1 weeks;
-    uint256 constant DEFAULT_FEE_BPS = 100;
-    uint128 constant MIN_ETH_RAISE = 1 ether;
+
+    uint256 constant DEFAULT_FEE_BPS = 30;
+    uint256 constant SALE_DURATION = 1 weeks;
+    uint256 constant MIN_ETH_RAISE = 1 ether;
     uint256 constant MINIMUM_LIQUIDITY = 1000;
 
-    /* ───────── storage (6 slots) ───────── */
+    /* ───────── storage (3 packed slots) ─────────
+       slot0: address(160) + saleCap(96)
+       slot1: lpSupply(96) + netSold(96) + deadline(64)
+       slot2: divisor(64) + ethEscrow(96) + ethTarget(96)
+    */
+
     struct Sale {
-        /* slot‑0 */
-        address creator;
-        uint96 divisor;
-        uint56 deadline;
-        /* slot‑1 */
-        uint96 saleCap;
-        uint96 lpSupply;
-        uint128 ethEscrow;
-        /* slot‑2 */
-        uint128 netSold;
-        uint128 ethTarget;
-        /* slot‑3 */
-        uint256 coinId;
+        address creator; // 160 bits
+        uint96 saleCap; //  96 bits
+        uint96 lpSupply; //  96 bits
+        uint96 netSold; //  96 bits
+        uint64 deadline; //  64 bits
+        uint64 divisor; //  64 bits
+        uint96 ethEscrow; //  96 bits
+        uint96 ethTarget; //  96 bits
     }
 
     mapping(uint256 => Sale) public sales;
@@ -46,13 +47,14 @@ contract zCurve {
     }
 
     /* ───────── events ───────── */
+
     event Launch(
         address indexed creator,
         uint256 indexed coinId,
         uint96 saleCap,
         uint96 lpSupply,
-        uint128 target,
-        uint96 divisor
+        uint96 target,
+        uint64 divisor
     );
     event Buy(address indexed buyer, uint256 indexed coinId, uint256 ethIn, uint128 coinsOut);
     event Sell(address indexed seller, uint256 indexed coinId, uint128 coinsIn, uint256 ethOut);
@@ -62,6 +64,7 @@ contract zCurve {
     /* =================================================================== *
                                    LAUNCH
     * =================================================================== */
+
     error InvalidParams();
     error OverflowTotalSupply();
 
@@ -71,9 +74,9 @@ contract zCurve {
         uint96 saleCap,
         uint96 lpSupply,
         string calldata uri,
-        uint128 ethTargetWei,
-        uint96 divisor
-    ) external returns (uint256 coinId) {
+        uint96 ethTargetWei,
+        uint64 divisor
+    ) public returns (uint256 coinId) {
         if (saleCap == 0 || lpSupply == 0 || ethTargetWei == 0 || divisor == 0) {
             revert InvalidParams();
         }
@@ -87,10 +90,10 @@ contract zCurve {
         /* handle creator tranche */
         if (creatorSupply != 0) {
             if (creatorUnlock > block.timestamp) {
-                /* lock to creator */
+                // lock to creator
                 Z.lockup(address(Z), msg.sender, coinId, creatorSupply, creatorUnlock);
             } else {
-                /* immediate transfer */
+                // immediate transfer
                 Z.transfer(msg.sender, coinId, creatorSupply);
             }
         }
@@ -98,12 +101,11 @@ contract zCurve {
         /* record sale */
         Sale storage S = sales[coinId];
         S.creator = msg.sender;
-        S.deadline = uint56(block.timestamp) + SALE_DURATION;
+        S.deadline = uint64(block.timestamp + SALE_DURATION);
         S.saleCap = saleCap;
         S.lpSupply = lpSupply;
         S.ethTarget = ethTargetWei;
         S.divisor = divisor;
-        S.coinId = coinId;
 
         emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
     }
@@ -111,13 +113,14 @@ contract zCurve {
     /* =================================================================== *
                                     BUY
     * =================================================================== */
-    error InvalidMsgVal();
-    error Finalized();
-    error TooLate();
+
     error SoldOut();
+    error TooLate();
+    error Finalized();
+    error InvalidMsgVal();
 
     function buyForExactEth(uint256 coinId, uint96 minCoins)
-        external
+        public
         payable
         lock
         returns (uint128 coinsOut, uint256 ethCost)
@@ -125,7 +128,7 @@ contract zCurve {
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
-        uint96 div = S.divisor;
+        uint64 div = S.divisor;
         uint96 left = S.saleCap - uint96(S.netSold);
 
         uint96 lo;
@@ -146,7 +149,7 @@ contract zCurve {
     }
 
     function buyExactCoins(uint256 coinId, uint96 coinsWanted)
-        external
+        public
         payable
         lock
         returns (uint128)
@@ -166,15 +169,16 @@ contract zCurve {
     }
 
     /* ---------- shared buy helpers ---------- */
-    function _preLiveCheck(Sale storage S) private view {
+
+    function _preLiveCheck(Sale storage S) internal view {
         if (S.creator == address(0)) revert Finalized();
         if (block.timestamp > S.deadline) revert TooLate();
     }
 
-    function _mintToBuyer(Sale storage S, uint256 coinId, uint96 coins, uint256 cost) private {
+    function _mintToBuyer(Sale storage S, uint256 coinId, uint96 coins, uint256 cost) internal {
         unchecked {
             S.netSold += coins;
-            S.ethEscrow += uint128(cost);
+            S.ethEscrow += uint96(cost);
             balances[coinId][msg.sender] += coins;
         }
         emit Buy(msg.sender, coinId, cost, coins);
@@ -185,12 +189,13 @@ contract zCurve {
     /* =================================================================== *
                                     SELL
     * =================================================================== */
-    error InsufficientBalance();
-    error InsufficientEscrow();
+
     error Slippage();
+    error InsufficientEscrow();
+    error InsufficientBalance();
 
     function sellExactCoins(uint256 coinId, uint96 coins, uint256 minEthOut)
-        external
+        public
         lock
         returns (uint256 refundWei)
     {
@@ -199,7 +204,7 @@ contract zCurve {
     }
 
     function sellForExactEth(uint256 coinId, uint256 desiredEthOut, uint96 maxCoins)
-        external
+        public
         lock
         returns (uint96 tokensBurned, uint256 refundWei)
     {
@@ -208,7 +213,7 @@ contract zCurve {
         if (S.creator == address(0)) revert Finalized();
         if (S.netSold == 0) revert InsufficientEscrow();
 
-        uint96 div = S.divisor;
+        uint64 div = S.divisor;
 
         uint96 lo = 1;
         uint96 hi = uint96(S.netSold);
@@ -226,7 +231,7 @@ contract zCurve {
     }
 
     /* ---------- core sell executor ---------- */
-    function _executeSell(uint256 coinId, uint96 coins) private returns (uint256 refund) {
+    function _executeSell(uint256 coinId, uint96 coins) internal returns (uint256 refund) {
         Sale storage S = sales[coinId];
         uint128 bal = balances[coinId][msg.sender];
         if (bal < coins) revert InsufficientBalance();
@@ -238,7 +243,7 @@ contract zCurve {
         unchecked {
             balances[coinId][msg.sender] = bal - coins;
             S.netSold -= coins;
-            S.ethEscrow -= uint128(refund);
+            S.ethEscrow -= uint96(refund);
         }
         emit Sell(msg.sender, coinId, coins, refund);
         safeTransferETH(msg.sender, refund);
@@ -247,11 +252,12 @@ contract zCurve {
     /* =================================================================== *
                                  FINALIZE
     * =================================================================== */
+
     error Pending();
     error RaiseTooSmall();
     error LPBalanceMismatch();
 
-    function finalize(uint256 coinId) external lock {
+    function finalize(uint256 coinId) public lock {
         Sale storage S = sales[coinId];
         if (S.creator == address(0)) revert Finalized();
 
@@ -261,7 +267,7 @@ contract zCurve {
         _finalize(S, coinId);
     }
 
-    function claim(uint256 coinId, uint128 coins) external lock {
+    function claim(uint256 coinId, uint128 coins) public lock {
         if (coins == 0) revert InvalidMsgVal();
         if (sales[coinId].creator != address(0)) revert Pending();
 
@@ -272,7 +278,7 @@ contract zCurve {
     }
 
     /* ---------- internal finalize ---------- */
-    function _finalize(Sale storage S, uint256 coinId) private {
+    function _finalize(Sale storage S, uint256 coinId) internal {
         uint256 coinAmt = S.lpSupply;
         if (Z.balanceOf(address(this), coinId) < coinAmt) revert LPBalanceMismatch();
 
@@ -323,28 +329,26 @@ contract zCurve {
         if (n < 2) return 0; // first two tokens are free
 
         unchecked {
-            // Cubic numerator (fits in 256 bits for uint96‑bounded n).
             uint256 num = n * (n - 1) * (2 * n - 1);
-
-            // Single 512‑bit mul‑div to scale by 1 ether and divide by 6·d.
             return fullMulDiv(num, 1 ether, 6 * d);
         }
     }
 
     /* ---------------- view helpers ---------------- */
-    function buyCost(uint256 coinId, uint96 coins) external view returns (uint256) {
+
+    function buyCost(uint256 coinId, uint96 coins) public view returns (uint256) {
         Sale storage S = sales[coinId];
         return _cost(S.netSold + coins, S.divisor) - _cost(S.netSold, S.divisor);
     }
 
-    function sellRefund(uint256 coinId, uint96 coins) external view returns (uint256) {
+    function sellRefund(uint256 coinId, uint96 coins) public view returns (uint256) {
         Sale storage S = sales[coinId];
         return _cost(S.netSold, S.divisor) - _cost(S.netSold - coins, S.divisor);
     }
 
-    function tokensForEth(uint256 coinId, uint256 weiIn) external view returns (uint96) {
+    function tokensForEth(uint256 coinId, uint256 weiIn) public view returns (uint96) {
         Sale storage S = sales[coinId];
-        uint96 div = S.divisor;
+        uint64 div = S.divisor;
 
         uint96 lo;
         uint96 hi = uint96(S.saleCap - S.netSold);
@@ -357,9 +361,9 @@ contract zCurve {
         return lo;
     }
 
-    function tokensToBurnForEth(uint256 coinId, uint256 weiOut) external view returns (uint96) {
+    function tokensToBurnForEth(uint256 coinId, uint256 weiOut) public view returns (uint96) {
         Sale storage S = sales[coinId];
-        uint96 div = S.divisor;
+        uint64 div = S.divisor;
 
         uint96 lo = 1;
         uint96 hi = uint96(S.netSold);
