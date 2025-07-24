@@ -69,7 +69,7 @@ contract zCurve {
     error OverflowTotalSupply();
 
     function launch(
-        uint96 creatorSupply,
+        uint256 creatorSupply,
         uint256 creatorUnlock,
         uint96 saleCap,
         uint96 lpSupply,
