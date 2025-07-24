@@ -14,8 +14,8 @@ contract ZCurveTest is Test {
     zCurve curve;
 
     /* mellow curve so tests use small ETH amounts */
-    uint96 constant DIV = 1_000_000;
-    uint96 constant TARGET = 0.5 ether;
+    uint256 constant DIV = 1_000_000;
+    uint128 constant TARGET = 0.5 ether;
 
     function setUp() public {
         vm.createSelectFork(vm.rpcUrl("main"));
@@ -28,7 +28,7 @@ contract ZCurveTest is Test {
     /* helper ---------------------------------------------------------- */
     function _launch(uint96 cap) internal returns (uint256 id) {
         /* duplicate LP tranche == saleCap for simplicity */
-        (id,) = curve.launch(0, 0, cap, cap, uint96(TARGET), uint64(DIV), "uri");
+        (id,) = curve.launch(0, 0, cap, cap, TARGET, DIV, "uri");
     }
 
     /* -----------------------------------------------------------------
@@ -37,7 +37,7 @@ contract ZCurveTest is Test {
     function testLaunchValues() public {
         uint96 cap = 1_000;
         uint96 lpDup = cap;
-        (uint256 coinId,) = curve.launch(0, 0, cap, lpDup, uint96(TARGET), uint64(DIV), "uri");
+        (uint256 coinId,) = curve.launch(0, 0, cap, lpDup, TARGET, DIV, "uri");
 
         (
             address c,
@@ -45,9 +45,9 @@ contract ZCurveTest is Test {
             uint96 lpSupply,
             uint96 sold,
             uint64 dl,
-            uint64 div,
-            uint96 esc,
-            uint96 tgt
+            uint256 div,
+            uint128 esc,
+            uint128 tgt
         ) = curve.sales(coinId);
 
         assertEq(c, owner);
@@ -110,7 +110,7 @@ contract ZCurveTest is Test {
     ------------------------------------------------------------------*/
     function testSellForExactEth() public {
         uint96 saleCap = 500;
-        (uint256 coinId,) = curve.launch(0, 0, saleCap, saleCap, 10 ether, uint64(DIV), "uri");
+        (uint256 coinId,) = curve.launch(0, 0, saleCap, saleCap, 10 ether, DIV, "uri");
 
         uint96 initialBuy = 300;
         uint256 buyCost = curve.buyCost(coinId, initialBuy);
@@ -168,7 +168,7 @@ contract ZCurveTest is Test {
     ------------------------------------------------------------------*/
     function testManualFinalizeAfterDeadline() public {
         uint96 cap = 1_000;
-        (uint256 coinId,) = curve.launch(0, 0, cap, cap, 3 ether, uint64(DIV), "uri");
+        (uint256 coinId,) = curve.launch(0, 0, cap, cap, 3 ether, DIV, "uri");
 
         uint96 buyAmt = 180;
         uint256 cost = curve.buyCost(coinId, buyAmt);
@@ -263,7 +263,7 @@ contract ZCurveTest is Test {
        FINAL. full life‑cycle: launch → buy → finalise → claim
     ------------------------------------------------------------------*/
     function testFullLifecycleClaim() public {
-        (uint256 coinId,) = curve.launch(0, 0, 1_000, 1_000, 3 ether, uint64(DIV), "uri");
+        (uint256 coinId,) = curve.launch(0, 0, 1_000, 1_000, 3 ether, DIV, "uri");
 
         /* mocks */
         vm.mockCall(
@@ -349,8 +349,8 @@ contract ZCurveTest is Test {
     function testLaunchPreBuyMintsAndEscrows() public {
         uint96 saleCap = 1_000;
         uint96 lpDup = saleCap;
-        uint96 target = TARGET;
-        uint64 div = uint64(DIV);
+        uint128 target = TARGET;
+        uint256 div = DIV;
 
         uint256 sendVal = 0.2 ether; // any positive amount
 
@@ -364,9 +364,9 @@ contract ZCurveTest is Test {
             uint96 lpSupply,
             uint96 netSold,
             ,
-            uint64 divisorRead,
-            uint96 esc,
-            uint96 tgt
+            uint256 divisorRead,
+            uint128 esc,
+            uint128 tgt
         ) = curve.sales(coinId);
 
         // After pre-buy, sale is still active unless we hit target
@@ -395,8 +395,8 @@ contract ZCurveTest is Test {
     function testLaunchPreBuyRefundsExcess() public {
         uint96 saleCap = 2_000;
         uint96 lpDup = saleCap;
-        uint96 target = TARGET;
-        uint64 div = uint64(DIV);
+        uint128 target = TARGET;
+        uint256 div = DIV;
 
         uint256 sendVal = 1 ether;
 
@@ -417,8 +417,8 @@ contract ZCurveTest is Test {
     function testLaunchPreBuyTooSmallReverts() public {
         uint96 saleCap = 1_000;
         uint96 lpDup = saleCap;
-        uint96 target = TARGET;
-        uint64 div = uint64(DIV);
+        uint128 target = TARGET;
+        uint256 div = uint256(DIV);
 
         // Sending 1 wei will still mint 1 free token (tokens 0 or 1)
         (uint256 coinId,) = curve.launch{value: 1}(0, 0, saleCap, lpDup, target, div, "uri");
@@ -431,8 +431,8 @@ contract ZCurveTest is Test {
     function testLaunchPreBuyAutoFinalize() public {
         uint96 saleCap = 800;
         uint96 lpDup = 200;
-        uint96 target = 0.05 ether;
-        uint64 div = 1_000_000_000;
+        uint128 target = 0.05 ether;
+        uint256 div = 1_000_000_000;
 
         // mock ZAMM calls used by finalize (balanceOf & addLiquidity) BEFORE launch
         vm.mockCall(

@@ -9,13 +9,8 @@ contract zCurve {
     uint256 constant DEFAULT_FEE_BPS = 30;
     uint256 constant SALE_DURATION = 1 weeks;
     uint256 constant MIN_ETH_RAISE = 1 ether;
-    uint256 constant MINIMUM_LIQUIDITY = 1000;
 
-    /* ───────── storage (3 packed slots) ─────────
-       slot0: address(160) + saleCap(96)
-       slot1: lpSupply(96) + netSold(96) + deadline(64)
-       slot2: divisor(64) + ethEscrow(96) + ethTarget(96)
-    */
+    /* ───────── storage (4 packed slots) ───────── */
 
     struct Sale {
         address creator;
@@ -23,9 +18,9 @@ contract zCurve {
         uint96 lpSupply;
         uint96 netSold;
         uint64 deadline;
-        uint64 divisor;
-        uint96 ethEscrow;
-        uint96 ethTarget;
+        uint256 divisor;
+        uint128 ethEscrow;
+        uint128 ethTarget;
     }
 
     mapping(uint256 => Sale) public sales;
@@ -56,8 +51,8 @@ contract zCurve {
         uint256 indexed coinId,
         uint96 saleCap,
         uint96 lpSupply,
-        uint96 target,
-        uint64 divisor
+        uint128 target,
+        uint256 divisor
     );
     event Buy(address indexed buyer, uint256 indexed coinId, uint256 ethIn, uint96 coinsOut);
     event Sell(address indexed seller, uint256 indexed coinId, uint96 coinsIn, uint256 ethOut);
@@ -76,8 +71,8 @@ contract zCurve {
         uint256 creatorUnlock,
         uint96 saleCap,
         uint96 lpSupply,
-        uint96 ethTargetWei,
-        uint64 divisor,
+        uint128 ethTargetWei,
+        uint256 divisor,
         string calldata uri
     ) public payable lock returns (uint256 coinId, uint96 coinsOut) {
         require(saleCap != 0 && lpSupply != 0 && ethTargetWei != 0 && divisor != 0, InvalidParams());
@@ -158,7 +153,7 @@ contract zCurve {
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
-        uint64 div = S.divisor;
+        uint256 div = S.divisor;
         uint96 lo;
         uint96 mid;
         uint96 hi = S.saleCap - S.netSold;
@@ -193,7 +188,7 @@ contract zCurve {
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
-        if (S.netSold + coinsWanted > S.saleCap) revert SoldOut();
+        require(S.saleCap >= S.netSold + coinsWanted, SoldOut());
 
         cost = _cost(S.netSold + coinsWanted, S.divisor) - _cost(S.netSold, S.divisor);
         require(msg.value >= cost, InvalidMsgVal());
@@ -212,7 +207,7 @@ contract zCurve {
     function _mintToBuyer(Sale storage S, uint256 coinId, uint96 coins, uint256 cost) internal {
         unchecked {
             S.netSold += coins;
-            S.ethEscrow += uint96(cost);
+            S.ethEscrow += uint128(cost);
             balances[coinId][msg.sender] += coins;
         }
         emit Buy(msg.sender, coinId, cost, coins);
@@ -226,15 +221,17 @@ contract zCurve {
 
     error Slippage();
     error InsufficientEscrow();
-    error InsufficientBalance();
 
     function sellExactCoins(uint256 coinId, uint96 coins, uint256 minEthOut)
         public
         lock
         returns (uint256 refundWei)
     {
-        refundWei = _executeSell(coinId, coins);
-        if (refundWei < minEthOut) revert Slippage();
+        Sale storage S = sales[coinId];
+        require(S.creator != address(0), Finalized());
+
+        refundWei = _executeSell(S, coinId, coins);
+        require(refundWei >= minEthOut, Slippage());
     }
 
     function sellForExactEth(uint256 coinId, uint256 desiredEthOut, uint96 maxCoins)
@@ -242,42 +239,43 @@ contract zCurve {
         lock
         returns (uint96 tokensBurned, uint256 refundWei)
     {
-        if (desiredEthOut == 0) revert InvalidMsgVal();
-        Sale storage S = sales[coinId];
-        if (S.creator == address(0)) revert Finalized();
-        if (S.netSold == 0) revert InsufficientEscrow();
+        require(desiredEthOut != 0, NoWant());
 
-        uint64 div = S.divisor;
+        Sale storage S = sales[coinId];
+        require(S.creator != address(0), Finalized());
+        require(S.netSold != 0, InsufficientEscrow());
+
+        uint256 div = S.divisor;
 
         uint96 lo = 1;
-        uint96 hi = uint96(S.netSold);
+        uint96 mid;
+        uint96 hi = S.netSold;
+        uint256 rf;
         while (lo < hi) {
-            uint96 mid = uint96((uint256(lo) + uint256(hi)) >> 1);
-            uint256 rf = _cost(S.netSold, div) - _cost(S.netSold - mid, div);
+            mid = uint96((uint256(lo) + uint256(hi)) >> 1);
+            rf = _cost(S.netSold, div) - _cost(S.netSold - mid, div);
             if (rf >= desiredEthOut) hi = mid;
             else lo = mid + 1;
         }
         tokensBurned = lo;
-        if (tokensBurned > maxCoins) revert Slippage();
+        require(tokensBurned <= maxCoins, Slippage());
 
-        refundWei = _executeSell(coinId, tokensBurned);
-        if (refundWei < desiredEthOut) revert Slippage();
+        refundWei = _executeSell(S, coinId, tokensBurned);
+        require(refundWei >= desiredEthOut, Slippage());
     }
 
     /* ---------- core sell executor ---------- */
-    function _executeSell(uint256 coinId, uint96 coins) internal returns (uint256 refund) {
-        Sale storage S = sales[coinId];
-        uint96 bal = balances[coinId][msg.sender];
-        if (bal < coins) revert InsufficientBalance();
-        if (S.creator == address(0)) revert Finalized();
-
+    function _executeSell(Sale storage S, uint256 coinId, uint96 coins)
+        internal
+        returns (uint256 refund)
+    {
         refund = _cost(S.netSold, S.divisor) - _cost(S.netSold - coins, S.divisor);
-        if (refund > S.ethEscrow) revert InsufficientEscrow();
+        require(refund <= S.ethEscrow, InsufficientEscrow());
 
+        balances[coinId][msg.sender] -= coins;
         unchecked {
-            balances[coinId][msg.sender] = bal - coins;
             S.netSold -= coins;
-            S.ethEscrow -= uint96(refund);
+            S.ethEscrow -= uint128(refund);
         }
         emit Sell(msg.sender, coinId, coins, refund);
         safeTransferETH(msg.sender, refund);
@@ -288,12 +286,10 @@ contract zCurve {
     * =================================================================== */
 
     error Pending();
-    error RaiseTooSmall();
-    error LPBalanceMismatch();
 
     function finalize(uint256 coinId) public lock {
         Sale storage S = sales[coinId];
-        if (S.creator == address(0)) revert Finalized();
+        require(S.creator != address(0), Finalized());
 
         bool timeGate = block.timestamp >= S.deadline && S.ethEscrow >= MIN_ETH_RAISE;
         if (!timeGate && S.ethEscrow < S.ethTarget) revert Pending();
@@ -313,12 +309,7 @@ contract zCurve {
     /* ---------- internal finalize ---------- */
     function _finalize(Sale storage S, uint256 coinId) internal {
         uint256 coinAmt = S.lpSupply;
-        if (Z.balanceOf(address(this), coinId) < coinAmt) revert LPBalanceMismatch();
-
         uint256 ethAmt = S.ethEscrow;
-
-        uint256 prod = ethAmt * coinAmt;
-        if (prod <= MINIMUM_LIQUIDITY * MINIMUM_LIQUIDITY) revert RaiseTooSmall();
 
         delete sales[coinId];
 
@@ -342,28 +333,18 @@ contract zCurve {
         emit Finalize(coinId, ethAmt, coinAmt, lp);
     }
 
-    /*─────────────────────  Bonding‑curve cost helper  ──────────────────────*
-    |  Spot price  p(k) = k² / d   (in wei)                                    |
-    |  Integral    Σₖ₌₀^{n‑1} k² = n(n‑1)(2n‑1) / 6                            |
-    |                                                                          |
-    |  Therefore:                                                              |
-    |      cost(n,d) = n(n‑1)(2n‑1) · 1 ether / (6·d)                          |
-    |                                                                          |
-    |  ‣  Tokens 0 and 1 cost zero ⇒ early‑return n < 2.                       |
-    |  ‣  `fullMulDiv()` is used once (at the end) to evaluate the             |
-    |     512‑bit numerator exactly and divide by 6·d without overflow.        |
-    |                                                                          |
-    |  NOTE: With the default uint96 supply cap, the unchecked multiplication  |
-    |        `n*(n‑1)*(2n‑1)` cannot overflow a uint256, but using             |
-    |        `fullMulDiv` on the final step guarantees safety if those caps    |
-    |        are ever raised.                                                  |
-    *──────────────────────────────────────────────────────────────────────────*/
+    /// @dev cost(n, d) = n(n-1)(2n-1) * 1e18 / (6 * d)
+    ///      First two tokens are free (n < 2).
     function _cost(uint256 n, uint256 d) internal pure returns (uint256) {
-        if (n < 2) return 0; // first two tokens are free
-
+        if (n < 2) return 0;
+        // Use fullMulDiv for *every* potentially overflowing multiply:
         unchecked {
-            uint256 num = n * (n - 1) * (2 * n - 1);
-            return fullMulDiv(num, 1 ether, 6 * d);
+            // Step 1: A = n * (n - 1)
+            uint256 A = fullMulDiv(n, n - 1, 1);
+            // Step 2: B = A * (2n - 1)
+            uint256 B = fullMulDiv(A, 2 * n - 1, 1);
+            // Step 3: scale by 1e18 and divide by 6*d
+            return fullMulDiv(B, 1 ether, 6 * d);
         }
     }
 
@@ -381,7 +362,7 @@ contract zCurve {
 
     function tokensForEth(uint256 coinId, uint256 weiIn) public view returns (uint96) {
         Sale storage S = sales[coinId];
-        uint64 div = S.divisor;
+        uint256 div = S.divisor;
 
         uint96 lo;
         uint96 hi = uint96(S.saleCap - S.netSold);
@@ -396,7 +377,7 @@ contract zCurve {
 
     function tokensToBurnForEth(uint256 coinId, uint256 weiOut) public view returns (uint96) {
         Sale storage S = sales[coinId];
-        uint64 div = S.divisor;
+        uint256 div = S.divisor;
 
         uint96 lo = 1;
         uint96 hi = uint96(S.netSold);
