@@ -396,17 +396,21 @@ contract zCurve {
     function tokensToBurnForEth(uint256 coinId, uint256 weiOut) public view returns (uint96) {
         Sale storage S = sales[coinId];
         if (S.creator == address(0) || S.netSold == 0) return 0;
+
         uint256 div = S.divisor;
+        uint256 c0 = _cost(S.netSold, div);
+        if (weiOut > c0) return 0;
 
         uint96 lo = 1;
-        uint96 mid;
         uint96 hi = S.netSold;
-        uint256 refund;
         while (lo < hi) {
-            mid = uint96((uint256(lo) + uint256(hi)) >> 1);
-            refund = _cost(S.netSold, div) - _cost(S.netSold - mid, div);
-            if (refund >= weiOut) hi = mid;
-            else lo = mid + 1;
+            uint96 mid = uint96((uint256(lo) + uint256(hi)) >> 1);
+            uint256 refund = c0 - _cost(S.netSold - mid, div);
+            if (refund >= weiOut) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
         }
         return lo;
     }
