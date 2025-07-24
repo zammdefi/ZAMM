@@ -8,6 +8,7 @@ contract zCurve {
 
     uint256 constant DEFAULT_FEE_BPS = 30;
     uint256 constant SALE_DURATION = 2 weeks;
+    uint256 constant MAX_DIV = type(uint256).max / 6;
 
     /* ───────── storage (4 packed slots) ───────── */
 
@@ -74,6 +75,7 @@ contract zCurve {
         uint256 divisor,
         string calldata uri
     ) public payable lock returns (uint256 coinId, uint96 coinsOut) {
+        require(divisor <= MAX_DIV, InvalidParams());
         require(saleCap != 0 && lpSupply != 0 && ethTargetWei != 0 && divisor != 0, InvalidParams());
 
         /* total minted = creator + sale tranche + LP tranche */
