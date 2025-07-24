@@ -73,9 +73,9 @@ contract zCurve {
         uint256 creatorUnlock,
         uint96 saleCap,
         uint96 lpSupply,
-        string calldata uri,
         uint96 ethTargetWei,
-        uint64 divisor
+        uint64 divisor,
+        string calldata uri
     ) public returns (uint256 coinId) {
         require(saleCap != 0 && lpSupply != 0 && ethTargetWei != 0 && divisor != 0, InvalidParams());
 
