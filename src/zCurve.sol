@@ -77,9 +77,7 @@ contract zCurve {
         uint96 ethTargetWei,
         uint64 divisor
     ) public returns (uint256 coinId) {
-        if (saleCap == 0 || lpSupply == 0 || ethTargetWei == 0 || divisor == 0) {
-            revert InvalidParams();
-        }
+        require(saleCap != 0 && lpSupply != 0 && ethTargetWei != 0 && divisor != 0, InvalidParams());
 
         /* total minted = creator + sale tranche + LP tranche */
         uint256 totalMint = creatorSupply + saleCap + lpSupply;
@@ -99,13 +97,15 @@ contract zCurve {
         }
 
         /* record sale */
-        Sale storage S = sales[coinId];
-        S.creator = msg.sender;
-        S.deadline = uint64(block.timestamp + SALE_DURATION);
-        S.saleCap = saleCap;
-        S.lpSupply = lpSupply;
-        S.ethTarget = ethTargetWei;
-        S.divisor = divisor;
+        unchecked {
+            Sale storage S = sales[coinId];
+            S.creator = msg.sender;
+            S.saleCap = saleCap;
+            S.lpSupply = lpSupply;
+            S.deadline = uint64(block.timestamp + SALE_DURATION);
+            S.divisor = divisor;
+            S.ethTarget = ethTargetWei;
+        }
 
         emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
     }
