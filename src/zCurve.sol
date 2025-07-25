@@ -107,6 +107,8 @@ contract zCurve {
             S.ethTarget = ethTargetWei;
         }
 
+        emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
+
         // netSold is guaranteed 0 at launch, so _cost(0, d) == 0, and
         // we can skip the subtraction and call _cost(mid, d) directly
         if (msg.value != 0) {
@@ -132,8 +134,6 @@ contract zCurve {
                 safeTransferETH(msg.sender, msg.value - ethCost);
             }
         }
-
-        emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
     }
 
     /* =================================================================== *
@@ -143,6 +143,7 @@ contract zCurve {
     error NoWant();
     error SoldOut();
     error TooLate();
+    error Slippage();
     error Finalized();
     error InvalidMsgVal();
 
@@ -157,25 +158,49 @@ contract zCurve {
         _preLiveCheck(S);
 
         uint256 div = S.divisor;
+        uint96 netSold = S.netSold;
+        uint96 remaining = S.saleCap - netSold;
+
+        // Shortcut: if they can afford every remaining token, skip the binary search:
+        {
+            uint256 fullCost = _cost(netSold + remaining, div) - _cost(netSold, div);
+            if (msg.value >= fullCost) {
+                require(remaining >= minCoins, Slippage());
+                coinsOut = remaining;
+                ethCost = fullCost;
+                _mintToBuyer(S, coinId, coinsOut, ethCost);
+                if (msg.value > ethCost) {
+                    safeTransferETH(msg.sender, msg.value - ethCost);
+                }
+                return (coinsOut, ethCost);
+            }
+        }
+
+        // Otherwise do a binary search over [0..remaining]
         uint96 lo;
         uint96 mid;
-        uint96 hi = S.saleCap - S.netSold;
+        uint96 hi = remaining;
         uint256 cost;
 
         while (lo < hi) {
             mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
-            cost = _cost(S.netSold + mid, div) - _cost(S.netSold, div);
-            if (cost <= msg.value) lo = mid;
-            else hi = mid - 1;
+            cost = _cost(netSold + mid, div) - _cost(netSold, div);
+            if (cost <= msg.value) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
 
         coinsOut = lo;
-        require(coinsOut != 0 && coinsOut >= minCoins, InvalidMsgVal());
+        require(coinsOut != 0 && coinsOut >= minCoins, Slippage());
 
-        ethCost = _cost(S.netSold + coinsOut, div) - _cost(S.netSold, div);
+        ethCost = _cost(netSold + coinsOut, div) - _cost(netSold, div);
         _mintToBuyer(S, coinId, coinsOut, ethCost);
 
-        if (msg.value > ethCost) safeTransferETH(msg.sender, msg.value - ethCost);
+        if (msg.value > ethCost) {
+            safeTransferETH(msg.sender, msg.value - ethCost);
+        }
     }
 
     function buyExactCoins(uint256 coinId, uint96 coinsWanted)
@@ -189,9 +214,11 @@ contract zCurve {
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
-        require(S.saleCap >= S.netSold + coinsWanted, SoldOut());
+        uint96 netSold = S.netSold;
 
-        cost = _cost(S.netSold + coinsWanted, S.divisor) - _cost(S.netSold, S.divisor);
+        require(S.saleCap >= netSold + coinsWanted, SoldOut());
+
+        cost = _cost(netSold + coinsWanted, S.divisor) - _cost(netSold, S.divisor);
         require(msg.value >= cost, InvalidMsgVal());
 
         _mintToBuyer(S, coinId, coinsWanted, cost);
@@ -210,17 +237,26 @@ contract zCurve {
             S.netSold += coins;
             S.ethEscrow += uint128(cost);
             balances[coinId][msg.sender] += coins;
-        }
-        emit Buy(msg.sender, coinId, cost, coins);
 
-        if (S.ethEscrow >= S.ethTarget) _finalize(S, coinId);
+            emit Buy(msg.sender, coinId, cost, coins);
+
+            /* Compute the marginal price of the *next* token */
+            uint256 nextMarginal = _cost(S.netSold + 1, S.divisor) - _cost(S.netSold, S.divisor);
+
+            // Auto‑finalize on hitting/exceeding target, selling out, or crossing the target:
+            if (
+                S.ethEscrow >= S.ethTarget || S.netSold == S.saleCap
+                    || S.ethEscrow + nextMarginal > S.ethTarget
+            ) {
+                _finalize(S, coinId);
+            }
+        }
     }
 
     /* =================================================================== *
                                     SELL
     * =================================================================== */
 
-    error Slippage();
     error InsufficientEscrow();
 
     function sellExactCoins(uint256 coinId, uint96 coins, uint256 minEthOut)
@@ -244,18 +280,20 @@ contract zCurve {
         require(desiredEthOut != 0, NoWant());
 
         Sale storage S = sales[coinId];
-        require(S.creator != address(0), Finalized());
-        require(S.netSold != 0, InsufficientEscrow());
 
         uint256 div = S.divisor;
+        uint96 netSold = S.netSold;
+
+        require(S.creator != address(0), Finalized());
+        require(netSold != 0, InsufficientEscrow());
 
         uint96 lo = 1;
         uint96 mid;
-        uint96 hi = S.netSold;
+        uint96 hi = netSold;
         uint256 rf;
         while (lo < hi) {
             mid = uint96((uint256(lo) + uint256(hi)) >> 1);
-            rf = _cost(S.netSold, div) - _cost(S.netSold - mid, div);
+            rf = _cost(netSold, div) - _cost(netSold - mid, div);
             if (rf >= desiredEthOut) hi = mid;
             else lo = mid + 1;
         }
@@ -312,15 +350,13 @@ contract zCurve {
         uint256 ethAmt = S.ethEscrow;
         uint256 coinAmt = S.lpSupply;
 
-        // If any portion of the sale remains unsold,
-        // scale LP tranche to match spot price:
-        if (S.netSold != S.saleCap) {
+        // Scale LP tranche to match spot price, even if sold out:
+        {
             uint256 k = S.netSold;
-            // Marginal spot price at boundary: wei per token (18-dec)
+            /* marginal spot price at boundary: wei per token (18‑dec) */
             uint256 p = _cost(k + 1, S.divisor) - _cost(k, S.divisor);
             uint256 scaled = ethAmt / p; // rounds down
-            if (scaled < coinAmt) coinAmt = scaled; // cap at lpSupply
-                // (If scaled >= lpSupply, we just keep full lpSupply)
+            if (scaled < coinAmt) coinAmt = scaled;
         }
 
         delete sales[coinId];
@@ -361,6 +397,46 @@ contract zCurve {
 
     /* ---------------- view helpers ---------------- */
 
+    // Price/Progress
+
+    /// @dev All the key sale parameters and live status for UI dashboards:
+    function saleSummary(uint256 coinId, address user)
+        public
+        view
+        returns (
+            address creator,
+            uint96 saleCap,
+            uint96 netSold,
+            uint128 ethEscrow,
+            uint128 ethTarget,
+            uint64 deadline,
+            bool isLive,
+            bool isFinalized,
+            uint256 currentPrice,
+            uint16 percentFunded,
+            uint64 timeRemaining,
+            uint96 userBalance
+        )
+    {
+        Sale storage S = sales[coinId];
+        creator = S.creator;
+        saleCap = S.saleCap;
+        netSold = S.netSold;
+        ethEscrow = S.ethEscrow;
+        ethTarget = S.ethTarget;
+        deadline = S.deadline;
+        isFinalized = (creator == address(0));
+        // live if launched, not yet finalized, before deadline, and not sold‑out/target
+        isLive = !isFinalized && block.timestamp <= deadline && netSold < saleCap
+            && ethEscrow < ethTarget;
+        currentPrice = isLive ? _cost(netSold + 1, S.divisor) - _cost(netSold, S.divisor) : 0;
+        percentFunded = ethTarget == 0 ? 0 : uint16((uint256(ethEscrow) * 10_000) / ethTarget);
+        timeRemaining = block.timestamp >= deadline ? 0 : deadline - uint64(block.timestamp);
+        userBalance = balances[coinId][user];
+    }
+
+    // Input/Output
+
     function buyCost(uint256 coinId, uint96 coins) public view returns (uint256) {
         Sale storage S = sales[coinId];
         if (S.creator == address(0)) return 0;
@@ -369,23 +445,25 @@ contract zCurve {
 
     function sellRefund(uint256 coinId, uint96 coins) public view returns (uint256) {
         Sale storage S = sales[coinId];
-        if (coins > S.netSold) return 0;
+        uint96 netSold = S.netSold;
+        if (coins > netSold) return 0;
         if (S.creator == address(0)) return 0;
-        return _cost(S.netSold, S.divisor) - _cost(S.netSold - coins, S.divisor);
+        return _cost(netSold, S.divisor) - _cost(netSold - coins, S.divisor);
     }
 
     function tokensForEth(uint256 coinId, uint256 weiIn) public view returns (uint96) {
         Sale storage S = sales[coinId];
         if (S.creator == address(0)) return 0;
         uint256 div = S.divisor;
+        uint96 netSold = S.netSold;
 
         uint96 lo;
         uint96 mid;
-        uint96 hi = S.saleCap - S.netSold;
+        uint96 hi = S.saleCap - netSold;
         uint256 cost;
         while (lo < hi) {
             mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
-            cost = _cost(S.netSold + mid, div) - _cost(S.netSold, div);
+            cost = _cost(netSold + mid, div) - _cost(netSold, div);
             if (cost <= weiIn) lo = mid;
             else hi = mid - 1;
         }
@@ -394,17 +472,18 @@ contract zCurve {
 
     function tokensToBurnForEth(uint256 coinId, uint256 weiOut) public view returns (uint96) {
         Sale storage S = sales[coinId];
-        if (S.creator == address(0) || S.netSold == 0) return 0;
+        uint96 netSold = S.netSold;
+        if (S.creator == address(0) || netSold == 0) return 0;
 
         uint256 div = S.divisor;
-        uint256 c0 = _cost(S.netSold, div);
+        uint256 c0 = _cost(netSold, div);
         if (weiOut > c0) return 0;
 
         uint96 lo = 1;
-        uint96 hi = S.netSold;
+        uint96 hi = netSold;
         while (lo < hi) {
             uint96 mid = uint96((uint256(lo) + uint256(hi)) >> 1);
-            uint256 refund = c0 - _cost(S.netSold - mid, div);
+            uint256 refund = c0 - _cost(netSold - mid, div);
             if (refund >= weiOut) {
                 hi = mid;
             } else {
