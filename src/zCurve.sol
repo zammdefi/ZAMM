@@ -5,12 +5,16 @@ contract zCurve {
     IZAMM constant Z = IZAMM(0x000000000000040470635EB91b7CE4D132D616eD);
 
     /* ───────── launchpad constants ──────── */
-
-    uint256 constant DEFAULT_FEE_BPS = 30;
     uint256 constant SALE_DURATION = 2 weeks;
     uint256 constant MAX_DIV = type(uint256).max / 6;
 
-    /* ───────── storage (4 packed slots) ───────── */
+    // - hook flags
+    uint256 constant FLAG_BEFORE = 1 << 255;
+    uint256 constant FLAG_AFTER = 1 << 254;
+    uint256 constant ADDR_MASK = (1 << 160) - 1;
+    uint256 constant MAX_FEE = 10000; // 100%
+
+    /* ───────── storage (5 packed slots) ───────── */
 
     struct Sale {
         address creator;
@@ -21,6 +25,7 @@ contract zCurve {
         uint256 divisor;
         uint128 ethEscrow;
         uint128 ethTarget;
+        uint256 feeOrHook;
     }
 
     mapping(uint256 => Sale) public sales;
@@ -64,6 +69,8 @@ contract zCurve {
     * =================================================================== */
 
     error InvalidParams();
+    error CurveTooCheap();
+    error InvalidFeeOrHook();
     error OverflowTotalSupply();
 
     function launch(
@@ -73,10 +80,18 @@ contract zCurve {
         uint96 lpSupply,
         uint128 ethTargetWei,
         uint256 divisor,
+        uint256 feeOrHook,
         string calldata uri
     ) public payable lock returns (uint256 coinId, uint96 coinsOut) {
-        require(divisor <= MAX_DIV, InvalidParams());
-        require(saleCap != 0 && lpSupply != 0 && ethTargetWei != 0 && divisor != 0, InvalidParams());
+        require(saleCap >= 5 && lpSupply != 0 && feeOrHook != 0, InvalidParams());
+        require(divisor != 0 && divisor <= MAX_DIV, InvalidParams());
+        require(ethTargetWei >= _cost(5, divisor), InvalidParams());
+
+        /* allow 0 < fee < 10000 bps or a well‑formed hook */
+        uint256 masked = feeOrHook & ~(FLAG_BEFORE | FLAG_AFTER);
+        require(
+            feeOrHook < MAX_FEE || ((masked & ~ADDR_MASK) == 0 && masked != 0), InvalidFeeOrHook()
+        );
 
         /* total minted = creator + sale tranche + LP tranche */
         uint256 totalMint = creatorSupply + saleCap + lpSupply;
@@ -105,9 +120,17 @@ contract zCurve {
             S.deadline = uint64(block.timestamp + SALE_DURATION);
             S.divisor = divisor;
             S.ethTarget = ethTargetWei;
+            S.feeOrHook = feeOrHook;
         }
 
         emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
+
+        // Make sure even the FINAL token price fits into uint256:
+        {
+            uint256 worst = _cost(uint256(saleCap), divisor); // cost to buy *all* tokens
+            // `worst` itself overflows ⇒ revert; otherwise compare to a sane upper bound.
+            require(worst <= type(uint256).max / 2, CurveTooCheap()); // or change the cap
+        }
 
         // netSold is guaranteed 0 at launch, so _cost(0, d) == 0, and
         // we can skip the subtraction and call _cost(mid, d) directly
@@ -349,6 +372,15 @@ contract zCurve {
     function _finalize(Sale storage S, uint256 coinId) internal {
         uint256 ethAmt = S.ethEscrow;
         uint256 coinAmt = S.lpSupply;
+        uint256 feeOrHook = S.feeOrHook;
+
+        // If fewer than two tokens sold, nothing has a market price.
+        // Burn LP tranche and return without adding liquidity:
+        if (S.netSold < 2) {
+            delete sales[coinId];
+            emit Finalize(coinId, 0, 0, 0);
+            return;
+        }
 
         // Scale LP tranche to match spot price, even if sold out:
         {
@@ -357,6 +389,13 @@ contract zCurve {
             uint256 p = _cost(k + 1, S.divisor) - _cost(k, S.divisor);
             uint256 scaled = ethAmt / p; // rounds down
             if (scaled < coinAmt) coinAmt = scaled;
+        }
+
+        // If LP tranche would be zero, just finalize without minting LP:
+        if (coinAmt == 0) {
+            delete sales[coinId];
+            emit Finalize(coinId, ethAmt, 0, 0);
+            return;
         }
 
         delete sales[coinId];
@@ -368,7 +407,7 @@ contract zCurve {
                 id1: coinId,
                 token0: address(0),
                 token1: address(Z),
-                feeOrHook: DEFAULT_FEE_BPS
+                feeOrHook: feeOrHook
             }),
             ethAmt,
             coinAmt,
@@ -381,17 +420,24 @@ contract zCurve {
         emit Finalize(coinId, ethAmt, coinAmt, lp);
     }
 
-    /// @dev cost(n, d) = n(n-1)(2n-1) * 1e18 / (6 * d)
+    /// @dev Quadratic bonding‑curve cost:
+    ///      cost = n(n‑1)(2n‑1) · 1e18 / (6 d)
     ///      First two tokens are free (n < 2).
+    ///
+    /// Uses Solady’s `fullMulDivUnchecked`, which performs a full 512‑bit
+    /// multiply‑divide **without** the `denominator > prod1` guard.
+    /// Will only revert if `d == 0` (already forbidden at launch) or if the
+    /// final cost itself cannot fit into uint256 — an economically impossible
+    /// scenario for any realistic sale.
     function _cost(uint256 n, uint256 d) internal pure returns (uint256) {
         if (n < 2) return 0;
         unchecked {
-            // 1) A = n * (n - 1)
-            uint256 A = fullMulDiv(n, n - 1, 1);
-            // 2) B = A * (2n - 1)
-            uint256 B = fullMulDiv(A, 2 * n - 1, 1);
-            // 3) Scale and divide
-            return fullMulDiv(B, 1 ether, 6 * d);
+            // Step‑1:  a = n · (n‑1)
+            uint256 a = fullMulDivUnchecked(n, n - 1, 1);
+            // Step‑2:  b = a · (2n‑1)
+            uint256 b = fullMulDivUnchecked(a, 2 * n - 1, 1);
+            // Step‑3:  cost = b · 1e18 / (6 d)
+            return fullMulDivUnchecked(b, 1 ether, 6 * d);
         }
     }
 
@@ -413,7 +459,7 @@ contract zCurve {
             bool isLive,
             bool isFinalized,
             uint256 currentPrice,
-            uint16 percentFunded,
+            uint24 percentFunded,
             uint64 timeRemaining,
             uint96 userBalance
         )
@@ -430,7 +476,7 @@ contract zCurve {
         isLive = !isFinalized && block.timestamp <= deadline && netSold < saleCap
             && ethEscrow < ethTarget;
         currentPrice = isLive ? _cost(netSold + 1, S.divisor) - _cost(netSold, S.divisor) : 0;
-        percentFunded = ethTarget == 0 ? 0 : uint16((uint256(ethEscrow) * 10_000) / ethTarget);
+        percentFunded = ethTarget == 0 ? 0 : uint24((uint256(ethEscrow) * 10_000) / ethTarget);
         timeRemaining = block.timestamp >= deadline ? 0 : deadline - uint64(block.timestamp);
         userBalance = balances[coinId][user];
     }
@@ -526,40 +572,29 @@ interface IZAMM {
 
 // Modified from Solady (https://github.com/Vectorized/solady/blob/main/src/utils/FixedPointMathLib.sol)
 
-error FullMulDivFailed();
-
-function fullMulDiv(uint256 x, uint256 y, uint256 d) pure returns (uint256 z) {
-    assembly ("memory-safe") {
+/// @dev Calculates `floor(x * y / d)` with full precision.
+/// Behavior is undefined if `d` is zero or the final result cannot fit in 256 bits.
+/// Performs the full 512 bit calculation regardless.
+function fullMulDivUnchecked(uint256 x, uint256 y, uint256 d) pure returns (uint256 z) {
+    /// @solidity memory-safe-assembly
+    assembly {
         z := mul(x, y)
-        for {} 1 {} {
-            if iszero(mul(or(iszero(x), eq(div(z, x), y)), d)) {
-                let mm := mulmod(x, y, not(0))
-                let p1 := sub(mm, add(z, lt(mm, z)))
-
-                let r := mulmod(x, y, d)
-                let t := and(d, sub(0, d))
-
-                if iszero(gt(d, p1)) {
-                    mstore(0x00, 0xae47f702)
-                    revert(0x1c, 0x04)
-                }
-                d := div(d, t)
-                let inv := xor(2, mul(3, d))
-                inv := mul(inv, sub(2, mul(d, inv)))
-                inv := mul(inv, sub(2, mul(d, inv)))
-                inv := mul(inv, sub(2, mul(d, inv)))
-                inv := mul(inv, sub(2, mul(d, inv)))
-                inv := mul(inv, sub(2, mul(d, inv)))
-                z :=
-                    mul(
-                        or(mul(sub(p1, gt(r, z)), add(div(sub(0, t), t), 1)), div(sub(z, r), t)),
-                        mul(sub(2, mul(d, inv)), inv)
-                    )
-                break
-            }
-            z := div(z, d)
-            break
-        }
+        let mm := mulmod(x, y, not(0))
+        let p1 := sub(mm, add(z, lt(mm, z)))
+        let t := and(d, sub(0, d))
+        let r := mulmod(x, y, d)
+        d := div(d, t)
+        let inv := xor(2, mul(3, d))
+        inv := mul(inv, sub(2, mul(d, inv)))
+        inv := mul(inv, sub(2, mul(d, inv)))
+        inv := mul(inv, sub(2, mul(d, inv)))
+        inv := mul(inv, sub(2, mul(d, inv)))
+        inv := mul(inv, sub(2, mul(d, inv)))
+        z :=
+            mul(
+                or(mul(sub(p1, gt(r, z)), add(div(sub(0, t), t), 1)), div(sub(z, r), t)),
+                mul(sub(2, mul(d, inv)), inv)
+            )
     }
 }
 
