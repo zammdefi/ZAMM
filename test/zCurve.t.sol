@@ -72,7 +72,7 @@ contract ZCurveTest is Test {
 
         uint256 cost = curve.buyCost(coinId, 10);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost + 0.1 ether}(coinId, 10);
+        curve.buyExactCoins{value: cost + 0.1 ether}(coinId, 10, 100 ether);
 
         assertEq(curve.balances(coinId, userA), 10);
         assertApproxEqAbs(userA.balance, 10 ether - cost, 1 gwei);
@@ -105,7 +105,7 @@ contract ZCurveTest is Test {
         // Buy 100 tokens
         uint96 purchaseAmt = 100;
         uint256 cost = curve.buyCost(coinId, purchaseAmt);
-        curve.buyExactCoins{value: cost}(coinId, purchaseAmt);
+        curve.buyExactCoins{value: cost}(coinId, purchaseAmt, 100 ether);
 
         // Sell back 20 tokens
         uint96 sellAmt = 20;
@@ -126,7 +126,7 @@ contract ZCurveTest is Test {
 
         uint96 initialBuy = 300;
         uint256 buyCost = curve.buyCost(coinId, initialBuy);
-        curve.buyExactCoins{value: buyCost}(coinId, initialBuy);
+        curve.buyExactCoins{value: buyCost}(coinId, initialBuy, 100 ether);
 
         uint96 burnQuote = curve.tokensToBurnForEth(coinId, 0.2 ether);
         vm.prank(owner);
@@ -169,7 +169,7 @@ contract ZCurveTest is Test {
         uint96 buyAmt = 200;
         uint256 cost = curve.buyCost(coinId, buyAmt);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost}(coinId, buyAmt);
+        curve.buyExactCoins{value: cost}(coinId, buyAmt, 100 ether);
 
         (address creator,,,,,,,,) = curve.sales(coinId);
         assertEq(creator, address(0));
@@ -185,7 +185,7 @@ contract ZCurveTest is Test {
         uint96 buyAmt = 180;
         uint256 cost = curve.buyCost(coinId, buyAmt);
         vm.prank(userB);
-        curve.buyExactCoins{value: cost}(coinId, buyAmt);
+        curve.buyExactCoins{value: cost}(coinId, buyAmt, 100 ether);
 
         vm.warp(block.timestamp + 2 weeks + 1);
 
@@ -237,7 +237,7 @@ contract ZCurveTest is Test {
         uint96 buyAmt = 300;
         uint256 cost = curve.buyCost(coinId, buyAmt);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost}(coinId, buyAmt);
+        curve.buyExactCoins{value: cost}(coinId, buyAmt, 100 ether);
 
         uint96 bal = curve.balances(coinId, userA);
         vm.prank(userA);
@@ -293,7 +293,7 @@ contract ZCurveTest is Test {
         uint96 buyAmt = 180;
         uint256 cost = curve.buyCost(coinId, buyAmt);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost}(coinId, buyAmt);
+        curve.buyExactCoins{value: cost}(coinId, buyAmt, 100 ether);
 
         vm.warp(block.timestamp + 2 weeks + 1);
         curve.finalize(coinId);
@@ -334,13 +334,13 @@ contract ZCurveTest is Test {
         uint96 buyA = 500;
         uint256 costA = curve.buyCost(coinId, buyA);
         vm.prank(userA);
-        curve.buyExactCoins{value: costA}(coinId, buyA);
+        curve.buyExactCoins{value: costA}(coinId, buyA, 100 ether);
 
         /* ── Buyer B takes the final 300 tokens ───────────────── */
         uint96 buyB = 300;
         uint256 costB = curve.buyCost(coinId, buyB); // re‑quote after netSold = 500
         vm.prank(userB);
-        curve.buyExactCoins{value: costB}(coinId, buyB);
+        curve.buyExactCoins{value: costB}(coinId, buyB, 100 ether);
 
         /* sale should be finalised now */
         (address creator,,,,,,,,) = curve.sales(coinId);
@@ -351,7 +351,7 @@ contract ZCurveTest is Test {
 
         /* further buys revert */
         vm.expectRevert(zCurve.Finalized.selector);
-        curve.buyExactCoins{value: 1 ether}(coinId, 1);
+        curve.buyExactCoins{value: 1 ether}(coinId, 1, 100 ether);
     }
 
     // ** MISC
@@ -491,7 +491,8 @@ contract ZCurveTest is Test {
             uint256 price,
             uint24 pctFunded,
             uint64 timeRem,
-            uint96 userBal
+            uint96 userBal,
+            ,
         ) = curve.saleSummary(coinId, userA);
 
         assertEq(creator, owner);
@@ -536,7 +537,8 @@ contract ZCurveTest is Test {
             , // price
             uint24 pctR,
             uint64 timeRemR,
-            uint96 balR
+            uint96 balR,
+            ,
         ) = curve.saleSummary(coinId, userA);
 
         assertEq(netSoldR, bought);
@@ -555,7 +557,7 @@ contract ZCurveTest is Test {
     function testFirstTokenFreeBuyExact() public {
         uint256 coinId = _launch(10);
         // Buying 1 token with zero ETH should succeed
-        curve.buyExactCoins{value: 0}(coinId, 1);
+        curve.buyExactCoins{value: 0}(coinId, 1, 100 ether);
         assertEq(curve.balances(coinId, owner), 1, "owner should have 1 free token");
     }
 
@@ -579,7 +581,7 @@ contract ZCurveTest is Test {
         assertGt(cost2, 0, "buyCost(2) should be positive");
         // Trying to buy 2 tokens for 0 ETH should revert
         vm.expectRevert(zCurve.InvalidMsgVal.selector);
-        curve.buyExactCoins{value: 0}(coinId, 2);
+        curve.buyExactCoins{value: 0}(coinId, 2, 100 ether);
     }
 
     /* -----------------------------------------------------------------
@@ -642,7 +644,7 @@ contract ZCurveTest is Test {
         uint96 buyN = 5;
         uint256 cost = curve.buyCost(coinId, buyN);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost}(coinId, buyN);
+        curve.buyExactCoins{value: cost}(coinId, buyN, 100 ether);
         assertEq(curve.balances(coinId, userA), buyN);
 
         // now sell 2 of them
@@ -722,14 +724,14 @@ contract ZCurveTest is Test {
         assertEq(creatorAfterBuy, address(0), "sale should be finalized on crossing target");
 
         // 6) saleSummary flags
-        (,,,,,, bool isLive, bool isFinalized,,,,) = curve.saleSummary(coinId, userA);
+        (,,,,,, bool isLive, bool isFinalized,,,,,,) = curve.saleSummary(coinId, userA);
         assertFalse(isLive, "isLive must be false postfinalize");
         assertTrue(isFinalized, "isFinalized must be true postfinalize");
 
         // 7) Further buys revert
         vm.expectRevert(zCurve.Finalized.selector);
         vm.prank(userA);
-        curve.buyExactCoins{value: 1}(coinId, 1);
+        curve.buyExactCoins{value: 1}(coinId, 1, 100 ether);
 
         // 8) userA’s ETH drop ≃ spent (ignoring gas)
         assertApproxEqAbs(before - userA.balance, spent, 1e15 /* ~0.001 ETH */ );
@@ -776,14 +778,14 @@ contract ZCurveTest is Test {
         assertEq(creatorAfterBuy, address(0), "sale should be finalized on crossing target");
 
         // 6) saleSummary flags
-        (,,,,,, bool isLive, bool isFinalized,,,,) = curve.saleSummary(coinId, userA);
+        (,,,,,, bool isLive, bool isFinalized,,,,,,) = curve.saleSummary(coinId, userA);
         assertFalse(isLive, "isLive must be false postfinalize");
         assertTrue(isFinalized, "isFinalized must be true postfinalize");
 
         // 7) Further buys revert
         vm.expectRevert(zCurve.Finalized.selector);
         vm.prank(userA);
-        curve.buyExactCoins{value: 1}(coinId, 1);
+        curve.buyExactCoins{value: 1}(coinId, 1, 100 ether);
 
         // 8) userA’s ETH drop ≃ spent (ignoring gas)
         assertApproxEqAbs(before - userA.balance, spent, 1e15 /* ~0.001 ETH */ );
@@ -799,12 +801,12 @@ contract ZCurveTest is Test {
         // Buy the entire cap
         uint256 cost = curve.buyCost(coinId, cap);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost}(coinId, cap);
+        curve.buyExactCoins{value: cost}(coinId, cap, 100 ether);
 
         // Next buyExactCoins should revert as Finalized
         vm.prank(userB);
         vm.expectRevert(zCurve.Finalized.selector);
-        curve.buyExactCoins{value: 1}(coinId, 1);
+        curve.buyExactCoins{value: 1}(coinId, 1, 100 ether);
     }
 
     /* -----------------------------------------------------------------
@@ -843,7 +845,7 @@ contract ZCurveTest is Test {
         // Buy some tokens first
         uint256 cost = curve.buyCost(coinId, 10);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost}(coinId, 10);
+        curve.buyExactCoins{value: cost}(coinId, 10, 100 ether);
 
         // Attempt to sell for more ETH than in escrow
         vm.prank(userA);
@@ -861,7 +863,7 @@ contract ZCurveTest is Test {
         // Buy a few tokens
         uint256 cost = curve.buyCost(coinId, 5);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost}(coinId, 5);
+        curve.buyExactCoins{value: cost}(coinId, 5, 100 ether);
 
         // Try to claim before finalization
         vm.prank(userA);
@@ -879,7 +881,7 @@ contract ZCurveTest is Test {
         // Buy 100 tokens first
         uint256 cost = curve.buyCost(coinId, 100);
         vm.prank(userA);
-        curve.buyExactCoins{value: cost}(coinId, 100);
+        curve.buyExactCoins{value: cost}(coinId, 100, 100 ether);
 
         // Read how much ETH is escrowed
         (,,,,,, uint128 esc,,) = curve.sales(coinId);
@@ -920,14 +922,14 @@ contract ZCurveTest is Test {
         uint256 coinId = _launch(10);
 
         // First token is free
-        curve.buyExactCoins{value: 0}(coinId, 1);
+        curve.buyExactCoins{value: 0}(coinId, 1, 100 ether);
         assertEq(curve.balances(coinId, owner), 1);
 
         // Second token now costs >0, so zero‑ETH should revert
         uint256 cost2 = curve.buyCost(coinId, 2) - curve.buyCost(coinId, 1);
         assertGt(cost2, 0);
         vm.expectRevert(zCurve.InvalidMsgVal.selector);
-        curve.buyExactCoins{value: 0}(coinId, 1);
+        curve.buyExactCoins{value: 0}(coinId, 1, 100 ether);
         // Balance unchanged
         assertEq(curve.balances(coinId, owner), 1);
     }
@@ -982,13 +984,13 @@ contract Reenter {
     }
 
     function start() external payable {
-        c.buyExactCoins{value: msg.value}(id, 1);
+        c.buyExactCoins{value: msg.value}(id, 1, 100 ether);
     }
 
     receive() external payable {
         if (!reentered) {
             reentered = true;
-            c.buyExactCoins{value: 1}(id, 1);
+            c.buyExactCoins{value: 1}(id, 1, 100 ether);
         }
     }
 }

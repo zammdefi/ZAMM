@@ -226,7 +226,7 @@ contract zCurve {
         }
     }
 
-    function buyExactCoins(uint256 coinId, uint96 coinsWanted)
+    function buyExactCoins(uint256 coinId, uint96 coinsWanted, uint256 maxEth)
         public
         payable
         lock
@@ -238,14 +238,16 @@ contract zCurve {
         _preLiveCheck(S);
 
         uint96 netSold = S.netSold;
-
         require(S.saleCap >= netSold + coinsWanted, SoldOut());
 
         cost = _cost(netSold + coinsWanted, S.divisor) - _cost(netSold, S.divisor);
+        require(cost <= maxEth, Slippage());
         require(msg.value >= cost, InvalidMsgVal());
 
         _mintToBuyer(S, coinId, coinsWanted, cost);
-        if (msg.value > cost) safeTransferETH(msg.sender, msg.value - cost);
+        if (msg.value > cost) {
+            safeTransferETH(msg.sender, msg.value - cost);
+        }
     }
 
     /* ---------- shared buy helpers ---------- */
@@ -461,7 +463,9 @@ contract zCurve {
             uint256 currentPrice,
             uint24 percentFunded,
             uint64 timeRemaining,
-            uint96 userBalance
+            uint96 userBalance,
+            uint256 feeOrHook,
+            uint256 divisor
         )
     {
         Sale storage S = sales[coinId];
@@ -479,6 +483,8 @@ contract zCurve {
         percentFunded = ethTarget == 0 ? 0 : uint24((uint256(ethEscrow) * 10_000) / ethTarget);
         timeRemaining = block.timestamp >= deadline ? 0 : deadline - uint64(block.timestamp);
         userBalance = balances[coinId][user];
+        feeOrHook = S.feeOrHook;
+        divisor = S.divisor;
     }
 
     // Input/Output
