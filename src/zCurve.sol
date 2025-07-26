@@ -15,7 +15,17 @@ contract zCurve {
     uint256 constant ADDR_MASK = (1 << 160) - 1;
     uint256 constant MAX_FEE = 10000; // 100%
 
-    /* ───────── storage (5 packed slots) ───────── */
+    // - lp unlock packing
+    // quadCapWithFlags layout:
+    // [255:160] = LP unlock timestamp (96 bits) - 0 means keep in zCurve
+    // [159:96]  = unused (64 bits) - reserved for future use
+    // [95:0]    = actual quadCap value (96 bits)
+
+    uint256 constant QUADCAP_MASK = (1 << 96) - 1;
+    uint256 constant LP_UNLOCK_SHIFT = 160;
+    uint256 constant LP_UNLOCK_MASK = ((1 << 96) - 1) << LP_UNLOCK_SHIFT;
+
+    /* ───────── storage (6 packed slots) ───────── */
 
     struct Sale {
         address creator;
@@ -27,6 +37,7 @@ contract zCurve {
         uint128 ethEscrow;
         uint128 ethTarget;
         uint256 feeOrHook;
+        uint256 quadCap;
     }
 
     mapping(uint256 => Sale) public sales;
@@ -65,13 +76,26 @@ contract zCurve {
     event Finalize(uint256 indexed coinId, uint256 ethLp, uint256 coinLp, uint256 lpMinted);
     event Claim(address indexed user, uint256 indexed coinId, uint96 amount);
 
+    /* ───────── bitpak ───────── */
+
+    function packQuadCap(uint96 quadCap, uint96 lpUnlock) public pure returns (uint256) {
+        return uint256(quadCap) | (uint256(lpUnlock) << LP_UNLOCK_SHIFT);
+    }
+
+    function unpackQuadCap(uint256 packed) public pure returns (uint96 quadCap, uint96 lpUnlock) {
+        quadCap = uint96(packed & QUADCAP_MASK);
+        lpUnlock = uint96((packed & LP_UNLOCK_MASK) >> LP_UNLOCK_SHIFT);
+    }
+
     /* =================================================================== *
                                    LAUNCH
     * =================================================================== */
 
     error InvalidCap();
+    error InvalidUnlock();
     error InvalidParams();
     error CurveTooCheap();
+    error InvalidQuadCap();
     error InvalidLpSupply();
     error InvalidFeeOrHook();
     error OverflowTotalSupply();
@@ -84,6 +108,8 @@ contract zCurve {
         uint128 ethTargetWei,
         uint256 divisor,
         uint256 feeOrHook,
+        uint256 quadCapWithFlags,
+        uint256 duration,
         string calldata uri
     ) public payable lock returns (uint256 coinId, uint96 coinsOut) {
         require(saleCap >= UNIT_SCALE && saleCap % UNIT_SCALE == 0, InvalidCap());
@@ -111,10 +137,16 @@ contract zCurve {
                 // lock to creator
                 Z.lockup(address(Z), msg.sender, coinId, creatorSupply, creatorUnlock);
             } else {
-                // immediate transfer
-                Z.transfer(msg.sender, coinId, creatorSupply);
+                // add to internal IOU
+                balances[coinId][msg.sender] += uint96(creatorSupply);
             }
         }
+
+        (uint96 quadCap, uint96 lpUnlock) = unpackQuadCap(quadCapWithFlags);
+        require(
+            quadCap >= UNIT_SCALE && quadCap <= saleCap && quadCap % UNIT_SCALE == 0,
+            InvalidQuadCap()
+        );
 
         Sale storage S = sales[coinId];
 
@@ -123,13 +155,18 @@ contract zCurve {
             S.creator = msg.sender;
             S.saleCap = saleCap;
             S.lpSupply = lpSupply;
-            S.deadline = uint64(block.timestamp + SALE_DURATION);
+            S.deadline = uint64(block.timestamp + duration);
             S.divisor = divisor;
             S.ethTarget = ethTargetWei;
             S.feeOrHook = feeOrHook;
+            S.quadCap = quadCapWithFlags;
         }
 
+        /* sanity check curve design */
         require(_cost(uint256(saleCap), S) <= type(uint256).max / 2, CurveTooCheap());
+        /* prevent creator unlock while sale is running */
+        require(creatorUnlock == 0 || creatorUnlock > S.deadline, InvalidUnlock());
+        require(lpUnlock == 0 || lpUnlock > S.deadline, InvalidUnlock());
 
         emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
 
@@ -384,6 +421,7 @@ contract zCurve {
         uint256 ethAmt = S.ethEscrow;
         uint256 coinAmt = S.lpSupply;
         uint256 feeOrHook = S.feeOrHook;
+        address creator = S.creator;
 
         // If fewer than two *ticks* sold, nothing has a market price.
         // Burn LP tranche and return without adding liquidity:
@@ -416,31 +454,55 @@ contract zCurve {
             return;
         }
 
+        (, uint96 lpUnlock) = unpackQuadCap(S.quadCap);
+
+        // Determine LP recipient based on unlock logic:
+        address lpRecipient;
+
+        if (lpUnlock == 0) {
+            /* default: LP stays in zCurve contract */
+            lpRecipient = address(this);
+        } else if (lpUnlock <= S.deadline) {
+            /* special case: immediate transfer to creator */
+            lpRecipient = S.creator;
+        } else {
+            /* lock LP tokens in Z with specified unlock time */
+            lpRecipient = address(Z);
+        }
+
         delete sales[coinId];
+
+        IZAMM.PoolKey memory poolKey = IZAMM.PoolKey({
+            id0: 0,
+            id1: coinId,
+            token0: address(0),
+            token1: address(Z),
+            feeOrHook: feeOrHook
+        });
 
         /* deposit LP tranche and add liquidity */
         (,, uint256 lp) = Z.addLiquidity{value: ethAmt}(
-            IZAMM.PoolKey({
-                id0: 0,
-                id1: coinId,
-                token0: address(0),
-                token1: address(Z),
-                feeOrHook: feeOrHook
-            }),
-            ethAmt,
-            coinAmt,
-            0,
-            0,
-            address(this),
-            block.timestamp
+            poolKey, ethAmt, coinAmt, 0, 0, lpRecipient, block.timestamp
         );
+
+        // If LP needs to be locked in Z:
+        if (lpUnlock != 0 && lpUnlock != S.deadline) {
+            uint256 poolId = _computePoolId(poolKey);
+            Z.lockup(address(Z), creator, poolId, lp, lpUnlock);
+        }
 
         emit Finalize(coinId, ethAmt, coinAmt, lp);
     }
 
+    function _computePoolId(IZAMM.PoolKey memory poolKey) internal pure returns (uint256 poolId) {
+        assembly ("memory-safe") {
+            poolId := keccak256(poolKey, 0xa0)
+        }
+    }
+
     /// @dev Quadratic‑then‑linear bonding‑curve cost, in wei.
     /// @param n  Number of base‑units (18‑dec) being bought.
-    /// @param S  The Sale struct, from which we read lpSupply and divisor.
+    /// @param S  The Sale struct, from which we read quadCap and divisor.
     /// @return weiCost  The total wei required to buy `n` tokens.
     function _cost(uint256 n, Sale storage S) internal view returns (uint256 weiCost) {
         // Convert to “tick” count (1 tick = UNIT_SCALE base‑units):
@@ -448,8 +510,8 @@ contract zCurve {
         // First tick free:
         if (m < 2) return 0;
 
-        // How many ticks do we run pure‑quad? Up to the LP tranche:
-        uint256 K = S.lpSupply / UNIT_SCALE;
+        // How many ticks do we run pure‑quad? Up to the quadCap:
+        uint256 K = (S.quadCap & QUADCAP_MASK) / UNIT_SCALE;
 
         // Our quadratic divisor:
         uint256 d = S.divisor;
@@ -520,7 +582,8 @@ contract zCurve {
             uint64 timeRemaining,
             uint96 userBalance,
             uint256 feeOrHook,
-            uint256 divisor
+            uint256 divisor,
+            uint256 quadCap
         )
     {
         Sale storage S = sales[coinId];
@@ -540,6 +603,7 @@ contract zCurve {
         userBalance = balances[coinId][user];
         feeOrHook = S.feeOrHook;
         divisor = S.divisor;
+        quadCap = S.quadCap;
     }
 
     // Input/Output
