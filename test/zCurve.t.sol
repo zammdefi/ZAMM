@@ -449,9 +449,9 @@ contract ZCurveTest is Test {
         /* ----------------  buy & auto‑finalise  ---------------- */
         vm.deal(userA, 20 ether);
         vm.prank(userA);
-        (uint96 out, uint256 spent) = curve.buyForExactEth{value: target}(coinId, 1);
+        (uint96 out, uint256 spent) = curve.buyForExactEth{value: target}(coinId, 0.001 ether);
 
-        assertTrue(out > 1 ether, "must receive >1 token");
+        assertTrue(out > 1 ether, "must receive >0.001 token");
         assertLe(spent, target, "must not overspend");
 
         /* sale struct should now be deleted */

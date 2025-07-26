@@ -152,8 +152,7 @@ contract zCurve {
                 else hi = mid - 1;
             }
 
-            coinsOut = lo;
-            coinsOut = _quantizeDown(coinsOut);
+            coinsOut = _quantizeDown(lo);
             require(coinsOut != 0, InvalidMsgVal());
 
             uint256 ethCost = _cost(coinsOut, divisor);
@@ -183,6 +182,10 @@ contract zCurve {
         returns (uint96 coinsOut, uint256 ethCost)
     {
         require(msg.value != 0, InvalidMsgVal());
+
+        minCoins = _quantizeDown(minCoins);
+        require(minCoins != 0, Slippage());
+
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
@@ -194,8 +197,8 @@ contract zCurve {
         {
             uint256 fullCost = _cost(netSold + remaining, div) - _cost(netSold, div);
             if (msg.value >= fullCost) {
-                require(remaining >= minCoins, Slippage());
                 coinsOut = _quantizeDown(remaining);
+                require(coinsOut >= minCoins, Slippage());
                 ethCost = fullCost;
                 _mintToBuyer(S, coinId, coinsOut, ethCost);
                 if (msg.value > ethCost) {
@@ -221,8 +224,7 @@ contract zCurve {
             }
         }
 
-        coinsOut = lo;
-        coinsOut = _quantizeDown(coinsOut);
+        coinsOut = _quantizeDown(lo);
         require(coinsOut != 0 && coinsOut >= minCoins, Slippage());
 
         ethCost = _cost(netSold + coinsOut, div) - _cost(netSold, div);
@@ -315,6 +317,9 @@ contract zCurve {
     {
         require(desiredEthOut != 0, NoWant());
 
+        maxCoins = _quantizeDown(maxCoins);
+        require(maxCoins != 0, Slippage());
+
         Sale storage S = sales[coinId];
 
         uint256 div = S.divisor;
@@ -333,8 +338,7 @@ contract zCurve {
             if (rf >= desiredEthOut) hi = mid;
             else lo = mid + 1;
         }
-        tokensBurned = lo;
-        tokensBurned = _quantizeUp(tokensBurned);
+        tokensBurned = _quantizeUp(lo);
         require(tokensBurned <= maxCoins, Slippage());
 
         refundWei = _executeSell(S, coinId, tokensBurned);
@@ -513,6 +517,8 @@ contract zCurve {
     // Input/Output
 
     function buyCost(uint256 coinId, uint96 coins) public view returns (uint256) {
+        coins = _quantizeDown(coins);
+        if (coins == 0) return 0;
         Sale storage S = sales[coinId];
         if (S.creator == address(0)) return 0;
         return _cost(S.netSold + coins, S.divisor) - _cost(S.netSold, S.divisor);
@@ -521,7 +527,8 @@ contract zCurve {
     function sellRefund(uint256 coinId, uint96 coins) public view returns (uint256) {
         Sale storage S = sales[coinId];
         uint96 netSold = S.netSold;
-        if (coins > netSold) return 0;
+        coins = _quantizeDown(coins);
+        if (coins == 0 || coins > netSold) return 0;
         if (S.creator == address(0)) return 0;
         return _cost(netSold, S.divisor) - _cost(netSold - coins, S.divisor);
     }
@@ -565,7 +572,6 @@ contract zCurve {
                 lo = mid + 1;
             }
         }
-
         return _quantizeUp(lo);
     }
 }
