@@ -72,6 +72,7 @@ contract zCurve {
     error InvalidCap();
     error InvalidParams();
     error CurveTooCheap();
+    error InvalidLpSupply();
     error InvalidFeeOrHook();
     error OverflowTotalSupply();
 
@@ -85,12 +86,12 @@ contract zCurve {
         uint256 feeOrHook,
         string calldata uri
     ) public payable lock returns (uint256 coinId, uint96 coinsOut) {
-        require(saleCap % UNIT_SCALE == 0, InvalidCap());
-        require(lpSupply % UNIT_SCALE == 0, InvalidCap());
-
-        require(saleCap >= 5 ether && lpSupply != 0 && feeOrHook != 0, InvalidParams());
-        require(divisor != 0 && divisor <= MAX_DIV, InvalidParams());
-        require(ethTargetWei >= _cost(5 ether, divisor), InvalidParams());
+        require(saleCap >= UNIT_SCALE && saleCap % UNIT_SCALE == 0, InvalidCap());
+        require(lpSupply >= UNIT_SCALE && lpSupply % UNIT_SCALE == 0, InvalidLpSupply());
+        require(
+            ethTargetWei != 0 && feeOrHook != 0 && divisor != 0 && divisor <= MAX_DIV,
+            InvalidParams()
+        );
 
         /* allow 0 < fee < 10000 bps or a well‑formed hook */
         uint256 masked = feeOrHook & ~(FLAG_BEFORE | FLAG_AFTER);
@@ -128,14 +129,9 @@ contract zCurve {
             S.feeOrHook = feeOrHook;
         }
 
-        emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
+        require(_cost(uint256(saleCap), S) <= type(uint256).max / 2, CurveTooCheap());
 
-        // Make sure even the FINAL token price fits into uint256:
-        {
-            uint256 worst = _cost(uint256(saleCap), divisor); // cost to buy *all* tokens
-            // `worst` itself overflows ⇒ revert; otherwise compare to a sane upper bound.
-            require(worst <= type(uint256).max / 2, CurveTooCheap()); // or change the cap
-        }
+        emit Launch(msg.sender, coinId, saleCap, lpSupply, ethTargetWei, divisor);
 
         // netSold is guaranteed 0 at launch, so _cost(0, d) == 0, and
         // we can skip the subtraction and call _cost(mid, d) directly
@@ -147,7 +143,7 @@ contract zCurve {
 
             while (lo < hi) {
                 mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
-                cost = _cost(mid, divisor);
+                cost = _cost(mid, S);
                 if (cost <= msg.value) lo = mid;
                 else hi = mid - 1;
             }
@@ -155,7 +151,7 @@ contract zCurve {
             coinsOut = _quantizeDown(lo);
             require(coinsOut != 0, InvalidMsgVal());
 
-            uint256 ethCost = _cost(coinsOut, divisor);
+            uint256 ethCost = _cost(coinsOut, S);
             _mintToBuyer(S, coinId, coinsOut, ethCost);
 
             if (msg.value > ethCost) {
@@ -189,13 +185,12 @@ contract zCurve {
         Sale storage S = sales[coinId];
         _preLiveCheck(S);
 
-        uint256 div = S.divisor;
         uint96 netSold = S.netSold;
         uint96 remaining = S.saleCap - netSold;
 
         // Shortcut: if they can afford every remaining token, skip the binary search:
         {
-            uint256 fullCost = _cost(netSold + remaining, div) - _cost(netSold, div);
+            uint256 fullCost = _cost(netSold + remaining, S) - _cost(netSold, S);
             if (msg.value >= fullCost) {
                 coinsOut = _quantizeDown(remaining);
                 require(coinsOut >= minCoins, Slippage());
@@ -208,7 +203,7 @@ contract zCurve {
             }
         }
 
-        // Otherwise do a binary search over [0..remaining]
+        // Otherwise do a binary search over [0..remaining]:
         uint96 lo;
         uint96 mid;
         uint96 hi = remaining;
@@ -216,7 +211,7 @@ contract zCurve {
 
         while (lo < hi) {
             mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
-            cost = _cost(netSold + mid, div) - _cost(netSold, div);
+            cost = _cost(netSold + mid, S) - _cost(netSold, S);
             if (cost <= msg.value) {
                 lo = mid;
             } else {
@@ -227,7 +222,7 @@ contract zCurve {
         coinsOut = _quantizeDown(lo);
         require(coinsOut != 0 && coinsOut >= minCoins, Slippage());
 
-        ethCost = _cost(netSold + coinsOut, div) - _cost(netSold, div);
+        ethCost = _cost(netSold + coinsOut, S) - _cost(netSold, S);
         _mintToBuyer(S, coinId, coinsOut, ethCost);
 
         if (msg.value > ethCost) {
@@ -250,7 +245,7 @@ contract zCurve {
         uint96 netSold = S.netSold;
         require(S.saleCap >= netSold + coinsWanted, SoldOut());
 
-        cost = _cost(netSold + coinsWanted, S.divisor) - _cost(netSold, S.divisor);
+        cost = _cost(netSold + coinsWanted, S) - _cost(netSold, S);
         require(cost <= maxEth, Slippage());
         require(msg.value >= cost, InvalidMsgVal());
 
@@ -276,8 +271,7 @@ contract zCurve {
             emit Buy(msg.sender, coinId, cost, coins);
 
             /* Compute the marginal price of the *next* token */
-            uint256 nextMarginal =
-                _cost(S.netSold + UNIT_SCALE, S.divisor) - _cost(S.netSold, S.divisor);
+            uint256 nextMarginal = _cost(S.netSold + UNIT_SCALE, S) - _cost(S.netSold, S);
 
             // Auto‑finalize on hitting/exceeding target, selling out, or crossing the target:
             if (
@@ -322,7 +316,6 @@ contract zCurve {
 
         Sale storage S = sales[coinId];
 
-        uint256 div = S.divisor;
         uint96 netSold = S.netSold;
 
         require(S.creator != address(0), Finalized());
@@ -334,7 +327,7 @@ contract zCurve {
         uint256 rf;
         while (lo < hi) {
             mid = uint96((uint256(lo) + uint256(hi)) >> 1);
-            rf = _cost(netSold, div) - _cost(netSold - mid, div);
+            rf = _cost(netSold, S) - _cost(netSold - mid, S);
             if (rf >= desiredEthOut) hi = mid;
             else lo = mid + 1;
         }
@@ -350,7 +343,7 @@ contract zCurve {
         internal
         returns (uint256 refund)
     {
-        refund = _cost(S.netSold, S.divisor) - _cost(S.netSold - coins, S.divisor);
+        refund = _cost(S.netSold, S) - _cost(S.netSold - coins, S);
         require(refund <= S.ethEscrow, InsufficientEscrow());
 
         balances[coinId][msg.sender] -= coins;
@@ -392,9 +385,9 @@ contract zCurve {
         uint256 coinAmt = S.lpSupply;
         uint256 feeOrHook = S.feeOrHook;
 
-        // If fewer than two tokens sold, nothing has a market price.
+        // If fewer than two *ticks* sold, nothing has a market price.
         // Burn LP tranche and return without adding liquidity:
-        if (S.netSold < 2 ether) {
+        if (S.netSold < 2 * UNIT_SCALE) {
             delete sales[coinId];
             emit Finalize(coinId, 0, 0, 0);
             return;
@@ -404,8 +397,15 @@ contract zCurve {
         {
             uint256 k = S.netSold;
             /* marginal spot price at boundary: wei per token (18‑dec) */
-            uint256 p = _cost(k + UNIT_SCALE, S.divisor) - _cost(k, S.divisor);
-            uint256 scaled = ethAmt / p; // rounds down
+            uint256 p = _cost(k + UNIT_SCALE, S) - _cost(k, S);
+            /* if p == 0 we still have no real market price → burn LP and exit */
+            if (p == 0) {
+                delete sales[coinId];
+                emit Finalize(coinId, 0, 0, 0);
+                return;
+            }
+            uint256 ticks = ethAmt / p; // how many 1 µ‑token quanta
+            uint256 scaled = ticks * UNIT_SCALE; // convert back to base units
             if (scaled < coinAmt) coinAmt = scaled;
         }
 
@@ -438,17 +438,46 @@ contract zCurve {
         emit Finalize(coinId, ethAmt, coinAmt, lp);
     }
 
-    /// @dev Quadratic bonding‑curve cost:
-    ///      cost(n,d) expects `n` in 18‑dec base‑units. Internally it first
-    ///      down‑scales by UNIT_SCALE (1e12) so that cubic math fits in uint256,
-    ///      then multiplies by 1 ether to return wei.
-    function _cost(uint256 n, uint256 d) internal pure returns (uint256) {
+    /// @dev Quadratic‑then‑linear bonding‑curve cost, in wei.
+    /// @param n  Number of base‑units (18‑dec) being bought.
+    /// @param S  The Sale struct, from which we read lpSupply and divisor.
+    /// @return weiCost  The total wei required to buy `n` tokens.
+    function _cost(uint256 n, Sale storage S) internal view returns (uint256 weiCost) {
+        // Convert to “tick” count (1 tick = UNIT_SCALE base‑units):
         uint256 m = n / UNIT_SCALE;
+        // First tick free:
         if (m < 2) return 0;
-        unchecked {
-            uint256 a = fullMulDivUnchecked(m, m - 1, 1);
-            uint256 b = fullMulDivUnchecked(a, 2 * m - 1, 1);
-            return fullMulDivUnchecked(b, 1 ether, 6 * d);
+
+        // How many ticks do we run pure‑quad? Up to the LP tranche:
+        uint256 K = S.lpSupply / UNIT_SCALE;
+
+        // Our quadratic divisor:
+        uint256 d = S.divisor;
+        // We factor out the common (6*d) denominator and 1 ETH numerator:
+        uint256 denom = 6 * d;
+        uint256 oneEth = 1 ether;
+
+        if (m <= K) {
+            // --- PURE QUADRATIC PHASE ---
+            // sum_{i=0..m-1} i^2 = m*(m-1)*(2m-1)/6
+            uint256 sumSq = m * (m - 1) * (2 * m - 1) / 6;
+            weiCost = (sumSq * oneEth) / denom;
+        } else {
+            // --- MIXED PHASE: QUAD TILL K, THEN LINEAR TAIL ---
+            // 1) Quad area for first K ticks:
+            //    sum_{i=0..K-1} i^2 = K*(K-1)*(2K-1)/6
+            uint256 sumK = K * (K - 1) * (2 * K - 1) / 6;
+            uint256 quadCost = (sumK * oneEth) / denom;
+
+            // 2) Marginal price at tick K (for ticks K→m):
+            //    p_K = cost(K+1) - cost(K) = (K^2 * 1 ETH) / (6*d)
+            uint256 pK = (K * K * oneEth) / denom;
+
+            // 3) Linear tail for the remaining (m - K) ticks:
+            uint256 tailTicks = m - K;
+            uint256 tailCost = pK * tailTicks;
+
+            weiCost = quadCost + tailCost;
         }
     }
 
@@ -505,8 +534,7 @@ contract zCurve {
         // live if launched, not yet finalized, before deadline, and not sold‑out/target
         isLive = !isFinalized && block.timestamp <= deadline && netSold < saleCap
             && ethEscrow < ethTarget;
-        currentPrice =
-            isLive ? _cost(netSold + UNIT_SCALE, S.divisor) - _cost(netSold, S.divisor) : 0;
+        currentPrice = isLive ? _cost(netSold + UNIT_SCALE, S) - _cost(netSold, S) : 0;
         percentFunded = ethTarget == 0 ? 0 : uint24((uint256(ethEscrow) * 10_000) / ethTarget);
         timeRemaining = block.timestamp >= deadline ? 0 : deadline - uint64(block.timestamp);
         userBalance = balances[coinId][user];
@@ -521,7 +549,7 @@ contract zCurve {
         if (coins == 0) return 0;
         Sale storage S = sales[coinId];
         if (S.creator == address(0)) return 0;
-        return _cost(S.netSold + coins, S.divisor) - _cost(S.netSold, S.divisor);
+        return _cost(S.netSold + coins, S) - _cost(S.netSold, S);
     }
 
     function sellRefund(uint256 coinId, uint96 coins) public view returns (uint256) {
@@ -530,13 +558,12 @@ contract zCurve {
         coins = _quantizeDown(coins);
         if (coins == 0 || coins > netSold) return 0;
         if (S.creator == address(0)) return 0;
-        return _cost(netSold, S.divisor) - _cost(netSold - coins, S.divisor);
+        return _cost(netSold, S) - _cost(netSold - coins, S);
     }
 
     function tokensForEth(uint256 coinId, uint256 weiIn) public view returns (uint96) {
         Sale storage S = sales[coinId];
         if (S.creator == address(0)) return 0;
-        uint256 div = S.divisor;
         uint96 netSold = S.netSold;
 
         uint96 lo;
@@ -545,7 +572,7 @@ contract zCurve {
         uint256 cost;
         while (lo < hi) {
             mid = uint96((uint256(lo) + uint256(hi + 1)) >> 1);
-            cost = _cost(netSold + mid, div) - _cost(netSold, div);
+            cost = _cost(netSold + mid, S) - _cost(netSold, S);
             if (cost <= weiIn) lo = mid;
             else hi = mid - 1;
         }
@@ -557,15 +584,14 @@ contract zCurve {
         uint96 netSold = S.netSold;
         if (S.creator == address(0) || netSold == 0) return 0;
 
-        uint256 div = S.divisor;
-        uint256 c0 = _cost(netSold, div);
+        uint256 c0 = _cost(netSold, S);
         if (weiOut > c0) return 0;
 
         uint96 lo = 1;
         uint96 hi = netSold;
         while (lo < hi) {
             uint96 mid = uint96((uint256(lo) + uint256(hi)) >> 1);
-            uint256 refund = c0 - _cost(netSold - mid, div);
+            uint256 refund = c0 - _cost(netSold - mid, S);
             if (refund >= weiOut) {
                 hi = mid;
             } else {
@@ -604,33 +630,6 @@ interface IZAMM {
         external
         returns (uint256 coinId);
     function transfer(address to, uint256 id, uint256 amount) external returns (bool);
-}
-
-// Modified from Solady (https://github.com/Vectorized/solady/blob/main/src/utils/FixedPointMathLib.sol)
-
-/// @dev Calculates `floor(x * y / d)` with full precision.
-/// Behavior is undefined if `d` is zero or the final result cannot fit in 256 bits.
-/// Performs the full 512 bit calculation regardless.
-function fullMulDivUnchecked(uint256 x, uint256 y, uint256 d) pure returns (uint256 z) {
-    assembly ("memory-safe") {
-        z := mul(x, y)
-        let mm := mulmod(x, y, not(0))
-        let p1 := sub(mm, add(z, lt(mm, z)))
-        let t := and(d, sub(0, d))
-        let r := mulmod(x, y, d)
-        d := div(d, t)
-        let inv := xor(2, mul(3, d))
-        inv := mul(inv, sub(2, mul(d, inv)))
-        inv := mul(inv, sub(2, mul(d, inv)))
-        inv := mul(inv, sub(2, mul(d, inv)))
-        inv := mul(inv, sub(2, mul(d, inv)))
-        inv := mul(inv, sub(2, mul(d, inv)))
-        z :=
-            mul(
-                or(mul(sub(p1, gt(r, z)), add(div(sub(0, t), t), 1)), div(sub(z, r), t)),
-                mul(sub(2, mul(d, inv)), inv)
-            )
-    }
 }
 
 // Modified from Solady (https://github.com/Vectorized/solady/blob/main/src/utils/SafeTransferLib.sol)

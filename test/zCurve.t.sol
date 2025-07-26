@@ -8,13 +8,36 @@ interface IERC6909 {
     function balanceOf(address, uint256) external view returns (uint256);
 }
 
+interface IPools {
+    function pools(uint256)
+        external
+        view
+        returns (
+            uint112 reserve0,
+            uint112 reserve1,
+            uint32 blockTimestampLast,
+            uint256 price0CumulativeLast,
+            uint256 price1CumulativeLast,
+            uint256 kLast,
+            uint256 supply
+        );
+}
+
 IZAMM constant Z = IZAMM(0x000000000000040470635EB91b7CE4D132D616eD);
+
+struct PoolKey {
+    uint256 id0;
+    uint256 id1;
+    address token0;
+    address token1;
+    uint256 feeOrHook; // bps-fee OR flags|address
+}
 
 /* ──────────────────────────────────────────────────────────────────── */
 contract ZCurveTest is Test {
     /* --- shared units ------------------------------------------------ */
     uint256 constant TOKEN = 1 ether; // one full 18‑dec token
-    uint256 constant MICRO = 1e12; // one curve “tick” (UNIT_SCALE)
+    uint96 constant MICRO = 1e12; // one curve “tick” (UNIT_SCALE)
     uint256 constant DIV = 10 ** 26; // super‑flat quadratic curve
 
     uint128 constant TARGET = 5 ether; // default sale target
@@ -24,6 +47,7 @@ contract ZCurveTest is Test {
     address owner = address(this);
     address userA = address(0xA0A0);
     address userB = address(0xB0B0);
+    address userC = address(0xCACA);
 
     zCurve curve;
 
@@ -38,6 +62,7 @@ contract ZCurveTest is Test {
         vm.deal(owner, 10 ether);
         vm.deal(userA, 10 ether);
         vm.deal(userB, 10 ether);
+        vm.deal(userC, 10 ether);
     }
 
     /* --- helpers ----------------------------------------------------- */
@@ -425,7 +450,7 @@ contract ZCurveTest is Test {
         // ── Setup a small sale but with a steep curve so the 2nd µ‑token costs 1 wei ──
         uint96 capTokens = uint96(100 * TOKEN); // 100 full tokens
         uint96 cap = capTokens; // saleCap and lpSupply
-        uint256 steepDiv = 1e18; // divisor small enough that cost(2 µ) == 1 wei
+        uint256 steepDiv = 1e17; // divisor small enough that cost(2 µ) == 1 wei
 
         // Launch with steep curve
         (uint256 coinId,) = curve.launch(
@@ -478,6 +503,264 @@ contract ZCurveTest is Test {
         // must fit within uint256/2 per launch’s safety check
         assertLe(worst, type(uint256).max / 2, "worst case cost must satisfy safety bound");
     }
+
+    /* 24. FT‑style sale with tiny 0.01 ETH target should launch cleanly */
+    function testFTTinyTargetLaunch() public {
+        // ── Parameters ───────────────────────────────────────────────
+        uint96 saleCapParam = uint96(800_000_000 ether);
+        uint96 lpSupplyParam = uint96(200_000_000 ether);
+        uint256 divisorParam = 16_000 * 1e18;
+        uint128 ethTargetParam = 0.01 ether;
+        uint256 feeOrHookParam = 30;
+
+        // ── Launch ────────────────────────────────────────────────────
+        (uint256 coinId,) = curve.launch(
+            /* creatorSupply */
+            0,
+            /* creatorUnlock */
+            0,
+            saleCapParam,
+            lpSupplyParam,
+            ethTargetParam,
+            divisorParam,
+            feeOrHookParam,
+            "FT tiny target"
+        );
+
+        // ── Validate via saleSummary ──────────────────────────────────
+        (
+            address creatorOut,
+            uint96 saleCapOut,
+            uint96 netSoldOut,
+            uint128 ethEscrowOut,
+            uint128 ethTargetOut,
+            uint64 deadlineOut,
+            bool isLiveOut,
+            bool isFinalizedOut,
+            uint256 currentPriceOut,
+            uint24 percentFundedOut,
+            uint64 timeRemainingOut,
+            uint96 userBalanceOut,
+            uint256 feeOrHookOut,
+            uint256 divisorOut
+        ) = curve.saleSummary(coinId, address(this));
+
+        // ── Assertions ────────────────────────────────────────────────
+        assertEq(creatorOut, address(this), "wrong creator");
+        assertEq(saleCapOut, saleCapParam, "saleCap mismatch");
+        assertEq(netSoldOut, 0, "netSold should start at 0");
+        assertEq(ethEscrowOut, 0, "ethEscrow should start at 0");
+        assertEq(ethTargetOut, ethTargetParam, "ethTarget mismatch");
+        assertGt(deadlineOut, uint64(block.timestamp), "deadline not set properly");
+        assertTrue(isLiveOut, "sale should be live");
+        assertFalse(isFinalizedOut, "sale should not be finalized");
+        assertEq(currentPriceOut, 0, "first utoken is free -> price == 0");
+        assertEq(percentFundedOut, 0, "percent funded should start at 0");
+        assertGt(timeRemainingOut, 0, "timeRemaining should be >0");
+        assertEq(userBalanceOut, 0, "userBalance should start at 0");
+        assertEq(feeOrHookOut, feeOrHookParam, "feeOrHook mismatch");
+        assertEq(divisorOut, divisorParam, "divisor mismatch");
+    }
+
+    /* 25. buyExactCoins reverts when asking for more than the saleCap → SoldOut */
+    function testBuyExactCoinsSoldOutReverts() public {
+        // cap = 10 full tokens
+        uint256 coinId = _launch(10);
+        uint96 saleCapParam = uint96(10 * TOKEN);
+        // ask for just one quantum above the cap
+        uint96 want = saleCapParam + uint96(MICRO);
+        vm.expectRevert(zCurve.SoldOut.selector);
+        // no ETH needed since first µ‑tokens are free, we still hit SoldOut
+        curve.buyExactCoins{value: 0}(coinId, want, type(uint256).max);
+    }
+
+    /* 26. buyForExactEth reverts after deadline (TooLate) */
+    function testBuyForExactEthRevertsAfterDeadline() public {
+        uint256 coinId = _launch(10);
+        // warp past the sale deadline
+        vm.warp(block.timestamp + 2 weeks + 1);
+        uint96 minCoins = uint96(MICRO); // non‑zero to get past the Slippage check
+        vm.expectRevert(zCurve.TooLate.selector);
+        curve.buyForExactEth{value: 1 ether}(coinId, minCoins);
+    }
+
+    /* 27. buyForExactEth reverts on slippage when minCoins exceeds purchasable */
+    function testBuyForExactEthSlippageReverts() public {
+        uint256 coinId = _launch(100);
+        // quote how many µ‑tokens 1 ETH buys
+        uint96 affordable = curve.tokensForEth(coinId, 1 ether);
+        // ask for one quantum more than that
+        uint96 minCoins = affordable + uint96(MICRO);
+        vm.prank(userA);
+        vm.expectRevert(zCurve.Slippage.selector);
+        curve.buyForExactEth{value: 1 ether}(coinId, minCoins);
+    }
+
+    /* 28. sellForExactEth reverts if no tokens sold yet → InsufficientEscrow */
+    function testSellForExactEthInsufficientEscrowReverts() public {
+        uint256 coinId = _launch(10);
+        vm.expectRevert(zCurve.InsufficientEscrow.selector);
+        curve.sellForExactEth(coinId, 1 wei, MICRO);
+    }
+
+    /* 29. sellForExactEth reverts if desiredEthOut == 0 → NoWant */
+    function testSellForExactEthNoWantReverts() public {
+        uint256 coinId = _launch(10);
+        // mint one free µ‑token so netSold > 0
+        vm.prank(userA);
+        curve.buyExactCoins{value: 0}(coinId, MICRO, type(uint256).max);
+        vm.expectRevert(zCurve.NoWant.selector);
+        curve.sellForExactEth(coinId, 0, MICRO);
+    }
+
+    /* 30. launch accepts simple fee < MAX_FEE and rounds‑trip in saleSummary */
+    function testLaunchValidFeeBps() public {
+        uint96 cap = uint96(5 ether);
+        uint256 fee = 5_000; // 50 %
+        (uint256 coinId,) = curve.launch(0, 0, cap, cap, TARGET, DIV, fee, "feebps");
+        (,,,,,,,,,,,, uint256 storedFee,) = curve.saleSummary(coinId, address(this));
+        assertEq(storedFee, fee, "feeOrHook should match simple BPS fee");
+    }
+
+    // SANITY
+
+    /* 31. Full FT‑style sale lifecycle: launch, purchase, auto‑finalize, claim */
+    function testFullLifecycleFTSale() public {
+        // ── Parameters ───────────────────────────────────────────────
+        uint96 saleCapParam = uint96(800_000_000 ether);
+        uint96 lpSupplyParam = uint96(200_000_000 ether);
+        uint128 ethTargetParam = 10 ether;
+        uint256 divisorParam = 2844444444444439111111111111133333333333333;
+        uint256 feeOrHookParam = 30;
+
+        // ── Launch ────────────────────────────────────────────────────
+        (uint256 coinId,) = curve.launch(
+            0,
+            0,
+            saleCapParam,
+            lpSupplyParam,
+            ethTargetParam,
+            divisorParam,
+            feeOrHookParam,
+            "full lifecycle"
+        );
+
+        // ── Pre‑purchase sanity ───────────────────────────────────────
+        (,,,,,, bool live1, bool fin1,,,,,,) = curve.saleSummary(coinId, userA);
+        assertTrue(live1, "must be live");
+        assertFalse(fin1, "must not be finalized yet");
+
+        // ── Purchase & auto‑finalize ─────────────────────────────────
+        uint96 minCoins = curve.tokensForEth(coinId, ethTargetParam);
+        vm.prank(userA);
+        (uint96 bought, uint256 spent) =
+            curve.buyForExactEth{value: ethTargetParam}(coinId, minCoins);
+
+        // never spend more than you sent, and must buy exactly the quote
+        assertLe(spent, ethTargetParam, "spent > target");
+        assertEq(bought, minCoins, "bought !+ quoted");
+
+        // ── Post‑purchase sanity ──────────────────────────────────────
+        (,,,,,,, bool fin2,,,, uint96 bal2,,) = curve.saleSummary(coinId, userA);
+        assertTrue(fin2, "sale should be finalized");
+        assertEq(bal2, bought, "balance should match bought");
+
+        // ── Claim ────────────────────────────────────────────────────
+        vm.prank(userA);
+        curve.claim(coinId, bought);
+        assertEq(IERC6909(address(Z)).balanceOf(userA, coinId), bought);
+
+        PoolKey memory key = PoolKey(0, coinId, address(0), address(Z), 30);
+
+        uint256 poolId = uint256(keccak256(abi.encode(key)));
+        (uint112 reserve0, uint112 reserve1,,,,, uint256 supply) = IPools(address(Z)).pools(poolId);
+
+        uint256 fullCost = curve.buyCost(coinId, saleCapParam);
+
+        assertGt(reserve0, fullCost);
+        assertEq(reserve1, lpSupplyParam);
+        assertTrue(supply > 0);
+
+        // ── After claim ──────────────────────────────────────────────
+        (,,,,,,,,,,, uint96 bal3,,) = curve.saleSummary(coinId, userA);
+        assertEq(bal3, 0, "balance must be zero after claim");
+    }
+
+    /* 31. Full FT‑style sale lifecycle: launch, purchase, auto‑finalize, claim */
+    function testFullLifecycleFullSale() public {
+        // ── Parameters ───────────────────────────────────────────────
+        uint96 saleCapParam = uint96(800_000_000 ether);
+        uint96 lpSupplyParam = uint96(200_000_000 ether);
+        uint128 ethTargetParam = 10 ether;
+        uint256 divisorParam = 2844444444444439111111111111113333333333334;
+        uint256 feeOrHookParam = 30;
+
+        // ── Launch ────────────────────────────────────────────────────
+        (uint256 coinId,) = curve.launch(
+            0,
+            0,
+            saleCapParam,
+            lpSupplyParam,
+            ethTargetParam,
+            divisorParam,
+            feeOrHookParam,
+            "full lifecycle"
+        );
+
+        // ── Pre‑purchase sanity ───────────────────────────────────────
+        (,,,,,, bool live1, bool fin1,,,,,,) = curve.saleSummary(coinId, userA);
+        assertTrue(live1, "must be live");
+        assertFalse(fin1, "must not be finalized yet");
+
+        // ── Purchase & auto‑finalize ─────────────────────────────────
+        uint96 minCoins = curve.tokensForEth(coinId, ethTargetParam);
+        vm.prank(userA);
+        (uint96 bought, uint256 spent) =
+            curve.buyForExactEth{value: ethTargetParam}(coinId, minCoins);
+
+        // never spend more than you sent, and must buy exactly the quote
+        assertLe(spent, ethTargetParam, "spent > target");
+        assertEq(bought, minCoins, "bought !+ quoted");
+
+        // ── Post‑purchase sanity ──────────────────────────────────────
+        (,,,,,,, bool fin2,,,, uint96 bal2,,) = curve.saleSummary(coinId, userA);
+        assertTrue(fin2, "sale should be finalized");
+        assertEq(bal2, bought, "balance should match bought");
+
+        // ── Claim ────────────────────────────────────────────────────
+        vm.prank(userA);
+        curve.claim(coinId, bought);
+        assertEq(IERC6909(address(Z)).balanceOf(userA, coinId), bought);
+
+        PoolKey memory key = PoolKey(0, coinId, address(0), address(Z), 30);
+
+        uint256 poolId = uint256(keccak256(abi.encode(key)));
+        (uint112 reserve0, uint112 reserve1,,,,, uint256 supply) = IPools(address(Z)).pools(poolId);
+
+        uint256 fullCost = curve.buyCost(coinId, saleCapParam);
+
+        assertGt(reserve0, fullCost);
+        assertEq(reserve1, lpSupplyParam);
+        assertTrue(supply > 0);
+
+        // ── After claim ──────────────────────────────────────────────
+        (,,,,,,,,,,, uint96 bal3,,) = curve.saleSummary(coinId, userA);
+        assertEq(bal3, 0, "balance must be zero after claim");
+    }
+
+    function pools(uint256)
+        public
+        view
+        returns (
+            uint112 reserve0,
+            uint112 reserve1,
+            uint32 blockTimestampLast,
+            uint256 price0CumulativeLast,
+            uint256 price1CumulativeLast,
+            uint256 kLast,
+            uint256 supply
+        )
+    {}
 
     // - EXTENDED TESTS
 
@@ -619,7 +902,7 @@ contract ZCurveTest is Test {
         /* ── compute reference cost with the analytic formula ────────── */
         uint256 m = uint256(coinsRaw) / 1e12; // # ticks (123 M)
         uint256 sum = _friendTechSum(m); // ∑ i²  (0‑based)
-        uint256 expected = (sum * 1 ether) / divFT; // scale to wei
+        uint256 expected = (sum * 1 ether) / (6 * divFT);
 
         assertEq(costViaContract, expected, "FT cost mismatch");
     }
@@ -649,6 +932,143 @@ contract ZCurveTest is Test {
 
         uint256 summation = sum2 - sum1;
         return summation * 1 ether / 16_000;
+    }
+
+    // MAJOR TEST
+
+    /* 32. full hybrid (quad→linear) sale: 800 M public, 200 M LP, 10 ETH target */
+    function testHybridQuadLinearSale() public {
+        // ── Config ──────────────────────────────────────────────────────
+        uint96 saleCap = uint96(800_000_000 ether);
+        uint96 lpSupply = uint96(200_000_000 ether);
+        uint128 ethTarget = 10 ether;
+
+        // “ticks” = base‑units / MICRO
+        uint256 K = uint256(lpSupply) / MICRO; // 200_000_000
+        uint256 m = uint256(saleCap) / MICRO; // 800_000_000
+
+        // Numerator for the hybrid area: sum_{i=0..K-1} i^2  +  K^2*(m-K)
+        uint256 sumK = K * (K - 1) * (2 * K - 1) / 6;
+        uint256 numer = sumK + (K * K) * (m - K);
+
+        // Solve for divisor so that totalCost = ethTarget
+        // totalCost = (numer * 1e18) / (6 * divisor)  ⇒  divisor = numer * 1e18 / (6 * ethTarget)
+        uint256 divisor = (numer * 1 ether) / (6 * ethTarget);
+
+        // ── Launch & Purchase ────────────────────────────────────────────
+        (uint256 coinId,) = curve.launch(
+            0, // creatorSupply
+            0, // creatorUnlock
+            saleCap,
+            lpSupply,
+            ethTarget,
+            divisor,
+            30, // feeOrHook
+            "hybrid-sale"
+        );
+
+        // Should quote the entire saleCap when spending exactly ethTarget:
+        uint96 quote = curve.tokensForEth(coinId, ethTarget);
+        assertEq(quote, saleCap, "must quote full saleCap");
+
+        // Do the buy
+        vm.prank(userA);
+        (uint96 bought, uint256 spent) = curve.buyForExactEth{value: ethTarget}(coinId, quote);
+
+        // we got the full cap, and didn’t overspend
+        assertEq(bought, saleCap, "bought != saleCap");
+        assertLe(spent, ethTarget, "spent > target");
+
+        // ── Post‑sale assertions ─────────────────────────────────────────
+        (,,,,,,, bool isFinalized,,,, uint96 balance,,) = curve.saleSummary(coinId, userA);
+
+        assertTrue(isFinalized, "sale should be autofinalized");
+        assertEq(balance, saleCap, "userBalance != saleCap");
+
+        vm.prank(userA);
+        curve.claim(coinId, bought);
+        assertEq(curve.balances(coinId, userA), 0, "claim should burn IOU");
+
+        assertEq(IERC6909(address(Z)).balanceOf(userA, coinId), bought);
+
+        PoolKey memory key = PoolKey(0, coinId, address(0), address(Z), 30);
+
+        uint256 poolId = uint256(keccak256(abi.encode(key)));
+        (uint112 reserve0, uint112 reserve1,,,,, uint256 supply) = IPools(address(Z)).pools(poolId);
+
+        assertApproxEqAbs(reserve0, ethTarget, 1e12, "ETH seed ~~ target");
+        assertEq(reserve1, lpSupply);
+        assertTrue(supply > 0);
+    }
+
+    /* 33. hybrid sale: quad-phase vs linear-phase pricing sanity check */
+    function testHybridQuadLinearPhases() public {
+        // ── Config ──────────────────────────────────────────────────────
+        uint96 saleCap = uint96(800_000_000 ether);
+        uint96 lpSupply = uint96(200_000_000 ether);
+        uint128 ethTarget = 10 ether;
+        uint256 _MICRO = 1e12; // UNIT_SCALE in ticks
+
+        // Compute “ticks” for saleCap and LP tranche:
+        uint256 K = uint256(lpSupply) / _MICRO; // 200 M ticks
+        uint256 m = uint256(saleCap) / _MICRO; // 800 M ticks
+
+        // Hybrid area numerator: ∑_{i=0..K-1} i²  +  K²·(m−K)
+        uint256 sumK = K * (K - 1) * (2 * K - 1) / 6;
+        uint256 numer = sumK + (K * K) * (m - K);
+
+        // Solve divisor so that totalCost = ethTarget:
+        // totalCost = (numer * 1 ETH) / (6·divisor)
+        uint256 divisor = (numer * 1 ether) / (6 * ethTarget);
+
+        // ── Launch the sale ─────────────────────────────────────────────
+        (uint256 coinId,) = curve.launch(
+            0, // creatorSupply
+            0, // creatorUnlock
+            saleCap,
+            lpSupply,
+            ethTarget,
+            divisor,
+            30, // feeOrHook
+            "hybrid-phases"
+        );
+
+        // ── 1) QUADRATIC PHASE ──────────────────────────────────────────
+        uint256 X = 20_000_000; // pick X < K
+        uint96 coinsX = uint96(X * _MICRO);
+        // expected cost = ∑_{i=0..X-1} i² / (6·divisor) * 1 ETH
+        uint256 sumX = X * (X - 1) * (2 * X - 1) / 6;
+        uint256 expectedQuad = (sumX * 1 ether) / (6 * divisor);
+
+        uint256 costX = curve.buyCost(coinId, coinsX);
+        assertEq(costX, expectedQuad, "quad phase cost mismatch");
+
+        vm.prank(userA);
+        curve.buyExactCoins{value: costX}(coinId, coinsX, type(uint256).max);
+
+        // ── 2) LINEAR PHASE ─────────────────────────────────────────────
+        // First climb from X ticks up to K ticks:
+        uint256 remainToK = K - X;
+        uint96 coinsToK = uint96(remainToK * _MICRO);
+        uint256 costToK = curve.buyCost(coinId, coinsToK);
+
+        vm.prank(userB);
+        curve.buyExactCoins{value: costToK}(coinId, coinsToK, type(uint256).max);
+
+        // Now netSold == K.  The marginal price for every further tick is
+        //    p_K = K² / (6·divisor) * 1 ETH
+        uint256 pK = (K * K * 1 ether) / (6 * divisor);
+
+        // Buy Y ticks in the “linear tail”:
+        uint256 Y = 5_000_000;
+        uint96 coinsY = uint96(Y * _MICRO);
+        uint256 expectedLin = pK * Y;
+
+        uint256 costY = curve.buyCost(coinId, coinsY);
+        assertEq(costY, expectedLin, "linear phase cost mismatch");
+
+        vm.prank(userC);
+        curve.buyExactCoins{value: costY}(coinId, coinsY, type(uint256).max);
     }
 }
 
