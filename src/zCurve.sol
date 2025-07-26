@@ -5,6 +5,7 @@ contract zCurve {
     IZAMM constant Z = IZAMM(0x000000000000040470635EB91b7CE4D132D616eD);
 
     /* ───────── launchpad constants ──────── */
+    uint256 constant UNIT_SCALE = 1e12;
     uint256 constant SALE_DURATION = 2 weeks;
     uint256 constant MAX_DIV = type(uint256).max / 6;
 
@@ -68,6 +69,7 @@ contract zCurve {
                                    LAUNCH
     * =================================================================== */
 
+    error InvalidCap();
     error InvalidParams();
     error CurveTooCheap();
     error InvalidFeeOrHook();
@@ -83,9 +85,12 @@ contract zCurve {
         uint256 feeOrHook,
         string calldata uri
     ) public payable lock returns (uint256 coinId, uint96 coinsOut) {
-        require(saleCap >= 5 && lpSupply != 0 && feeOrHook != 0, InvalidParams());
+        require(saleCap % UNIT_SCALE == 0, InvalidCap());
+        require(lpSupply % UNIT_SCALE == 0, InvalidCap());
+
+        require(saleCap >= 5 ether && lpSupply != 0 && feeOrHook != 0, InvalidParams());
         require(divisor != 0 && divisor <= MAX_DIV, InvalidParams());
-        require(ethTargetWei >= _cost(5, divisor), InvalidParams());
+        require(ethTargetWei >= _cost(5 ether, divisor), InvalidParams());
 
         /* allow 0 < fee < 10000 bps or a well‑formed hook */
         uint256 masked = feeOrHook & ~(FLAG_BEFORE | FLAG_AFTER);
@@ -148,6 +153,7 @@ contract zCurve {
             }
 
             coinsOut = lo;
+            coinsOut = _quantizeDown(coinsOut);
             require(coinsOut != 0, InvalidMsgVal());
 
             uint256 ethCost = _cost(coinsOut, divisor);
@@ -189,7 +195,7 @@ contract zCurve {
             uint256 fullCost = _cost(netSold + remaining, div) - _cost(netSold, div);
             if (msg.value >= fullCost) {
                 require(remaining >= minCoins, Slippage());
-                coinsOut = remaining;
+                coinsOut = _quantizeDown(remaining);
                 ethCost = fullCost;
                 _mintToBuyer(S, coinId, coinsOut, ethCost);
                 if (msg.value > ethCost) {
@@ -216,6 +222,7 @@ contract zCurve {
         }
 
         coinsOut = lo;
+        coinsOut = _quantizeDown(coinsOut);
         require(coinsOut != 0 && coinsOut >= minCoins, Slippage());
 
         ethCost = _cost(netSold + coinsOut, div) - _cost(netSold, div);
@@ -232,6 +239,7 @@ contract zCurve {
         lock
         returns (uint256 cost)
     {
+        coinsWanted = _quantizeDown(coinsWanted);
         require(coinsWanted != 0, NoWant());
 
         Sale storage S = sales[coinId];
@@ -266,7 +274,8 @@ contract zCurve {
             emit Buy(msg.sender, coinId, cost, coins);
 
             /* Compute the marginal price of the *next* token */
-            uint256 nextMarginal = _cost(S.netSold + 1, S.divisor) - _cost(S.netSold, S.divisor);
+            uint256 nextMarginal =
+                _cost(S.netSold + UNIT_SCALE, S.divisor) - _cost(S.netSold, S.divisor);
 
             // Auto‑finalize on hitting/exceeding target, selling out, or crossing the target:
             if (
@@ -289,7 +298,9 @@ contract zCurve {
         lock
         returns (uint256 refundWei)
     {
+        coins = _quantizeDown(coins);
         require(coins != 0, NoWant());
+
         Sale storage S = sales[coinId];
         require(S.creator != address(0), Finalized());
 
@@ -323,6 +334,7 @@ contract zCurve {
             else lo = mid + 1;
         }
         tokensBurned = lo;
+        tokensBurned = _quantizeUp(tokensBurned);
         require(tokensBurned <= maxCoins, Slippage());
 
         refundWei = _executeSell(S, coinId, tokensBurned);
@@ -378,7 +390,7 @@ contract zCurve {
 
         // If fewer than two tokens sold, nothing has a market price.
         // Burn LP tranche and return without adding liquidity:
-        if (S.netSold < 2) {
+        if (S.netSold < 2 ether) {
             delete sales[coinId];
             emit Finalize(coinId, 0, 0, 0);
             return;
@@ -388,7 +400,7 @@ contract zCurve {
         {
             uint256 k = S.netSold;
             /* marginal spot price at boundary: wei per token (18‑dec) */
-            uint256 p = _cost(k + 1, S.divisor) - _cost(k, S.divisor);
+            uint256 p = _cost(k + UNIT_SCALE, S.divisor) - _cost(k, S.divisor);
             uint256 scaled = ethAmt / p; // rounds down
             if (scaled < coinAmt) coinAmt = scaled;
         }
@@ -423,24 +435,34 @@ contract zCurve {
     }
 
     /// @dev Quadratic bonding‑curve cost:
-    ///      cost = n(n‑1)(2n‑1) · 1e18 / (6 d)
-    ///      First two tokens are free (n < 2).
-    ///
-    /// Uses Solady’s `fullMulDivUnchecked`, which performs a full 512‑bit
-    /// multiply‑divide **without** the `denominator > prod1` guard.
-    /// Will only revert if `d == 0` (already forbidden at launch) or if the
-    /// final cost itself cannot fit into uint256 — an economically impossible
-    /// scenario for any realistic sale.
+    ///      cost(n,d) expects `n` in 18‑dec base‑units. Internally it first
+    ///      down‑scales by UNIT_SCALE (1e12) so that cubic math fits in uint256,
+    ///      then multiplies by 1 ether to return wei.
     function _cost(uint256 n, uint256 d) internal pure returns (uint256) {
-        if (n < 2) return 0;
+        uint256 m = n / UNIT_SCALE;
+        if (m < 2) return 0;
         unchecked {
-            // Step‑1:  a = n · (n‑1)
-            uint256 a = fullMulDivUnchecked(n, n - 1, 1);
-            // Step‑2:  b = a · (2n‑1)
-            uint256 b = fullMulDivUnchecked(a, 2 * n - 1, 1);
-            // Step‑3:  cost = b · 1e18 / (6 d)
+            uint256 a = fullMulDivUnchecked(m, m - 1, 1);
+            uint256 b = fullMulDivUnchecked(a, 2 * m - 1, 1);
             return fullMulDivUnchecked(b, 1 ether, 6 * d);
         }
+    }
+
+    /* ---------------- granularity ---------------- */
+
+    error InvalidGranularity();
+
+    /// @dev Down‑round to the nearest multiple of UNIT_SCALE (1e12 base‑units).
+    function _quantizeDown(uint96 amount) internal pure returns (uint96) {
+        return uint96(uint256(amount) / UNIT_SCALE * UNIT_SCALE);
+    }
+
+    /// @dev Up‑round to the nearest multiple of UNIT_SCALE, but cap at uint96::max.
+    /// Used when we must not give the user *less* refund than requested.
+    function _quantizeUp(uint96 amount) internal pure returns (uint96) {
+        uint256 q = (uint256(amount) + UNIT_SCALE - 1) / UNIT_SCALE * UNIT_SCALE;
+        require(q <= type(uint96).max, InvalidGranularity());
+        return uint96(q);
     }
 
     /* ---------------- view helpers ---------------- */
@@ -479,7 +501,8 @@ contract zCurve {
         // live if launched, not yet finalized, before deadline, and not sold‑out/target
         isLive = !isFinalized && block.timestamp <= deadline && netSold < saleCap
             && ethEscrow < ethTarget;
-        currentPrice = isLive ? _cost(netSold + 1, S.divisor) - _cost(netSold, S.divisor) : 0;
+        currentPrice =
+            isLive ? _cost(netSold + UNIT_SCALE, S.divisor) - _cost(netSold, S.divisor) : 0;
         percentFunded = ethTarget == 0 ? 0 : uint24((uint256(ethEscrow) * 10_000) / ethTarget);
         timeRemaining = block.timestamp >= deadline ? 0 : deadline - uint64(block.timestamp);
         userBalance = balances[coinId][user];
@@ -519,7 +542,7 @@ contract zCurve {
             if (cost <= weiIn) lo = mid;
             else hi = mid - 1;
         }
-        return lo;
+        return _quantizeDown(lo);
     }
 
     function tokensToBurnForEth(uint256 coinId, uint256 weiOut) public view returns (uint96) {
@@ -542,7 +565,8 @@ contract zCurve {
                 lo = mid + 1;
             }
         }
-        return lo;
+
+        return _quantizeUp(lo);
     }
 }
 
@@ -582,8 +606,7 @@ interface IZAMM {
 /// Behavior is undefined if `d` is zero or the final result cannot fit in 256 bits.
 /// Performs the full 512 bit calculation regardless.
 function fullMulDivUnchecked(uint256 x, uint256 y, uint256 d) pure returns (uint256 z) {
-    /// @solidity memory-safe-assembly
-    assembly {
+    assembly ("memory-safe") {
         z := mul(x, y)
         let mm := mulmod(x, y, not(0))
         let p1 := sub(mm, add(z, lt(mm, z)))
