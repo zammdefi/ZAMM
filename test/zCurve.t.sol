@@ -341,6 +341,144 @@ contract ZCurveTest is Test {
         attacker.start{value: baseCost}();
     }
 
+    /* 16. launch rejects bad feeOrHook once saleCap ≥ 5 ETH */
+    function testLaunchInvalidFeeOrHookReverts() public {
+        uint96 cap = uint96(5 ether);
+        // Only a flag bit, no lower‐160‐bit addr → masked == 0 → fails hook check
+        uint256 justFlag = uint256(1) << 255;
+        vm.expectRevert(zCurve.InvalidFeeOrHook.selector);
+        curve.launch(
+            0, // creatorSupply
+            0, // creatorUnlock
+            cap, // saleCap (5 ETH)
+            cap, // lpSupply  (5 ETH)
+            TARGET, // ethTarget
+            DIV, // divisor
+            justFlag, // feeOrHook
+            "bad fee"
+        );
+    }
+
+    /* 17. launch accepts a valid “hook” style feeOrHook */
+    function testLaunchValidHook() public {
+        uint96 cap = uint96(5 ether);
+        // Build a hook: FLAG_BEFORE | lower‐160‐bits nonzero address
+        uint256 hook = (uint256(1) << 255) | uint256(uint160(address(0x1234)));
+        (uint256 coinId,) = curve.launch(0, 0, cap, cap, TARGET, DIV, hook, "hooked");
+
+        // Read it back via saleSummary
+        (,,,,,,,,,,,, uint256 storedHook,) = curve.saleSummary(coinId, address(0));
+        assertEq(storedHook, hook, "feeOrHook should roundtrip");
+    }
+
+    /* 18. saleSummary price & state transitions (free first tick) */
+    function testSaleSummaryStateTransitions() public {
+        // Launch with a target but no buys yet
+        uint256 coinId = _launchWithTarget(20, TARGET);
+
+        // Immediately after launch
+        (,,,,,, bool isLive, bool isFinalized, uint256 price,,,,,) =
+            curve.saleSummary(coinId, userA);
+
+        assertTrue(isLive, "should be live right after launch");
+        assertFalse(isFinalized, "must not be finalized yet");
+        // First quantum is free, so the marginal price is zero
+        assertEq(price, 0, "first tick is free => price == 0");
+
+        // Warp past the deadline
+        vm.warp(block.timestamp + 2 weeks + 1);
+        (,,,,,, bool live2, bool fin2, uint256 price2,,,,,) = curve.saleSummary(coinId, userA);
+
+        assertFalse(live2, "sale must no longer be live");
+        assertFalse(fin2, "still not autofinalized until finalize()");
+        assertEq(price2, 0, "price should be 0 when expired");
+    }
+
+    /* 20. buyCost floors non‑aligned coins via _quantizeDown */
+    function testBuyCostQuantizationDown() public {
+        uint256 coinId = _launch(1_000); // 1 000 tokens total
+        // ask cost for (1 µ + 123 wei) instead of exactly 1 µ
+        uint96 ask = uint96(MICRO + 123);
+        uint256 costFloored = curve.buyCost(coinId, ask);
+        // should equal cost of exactly 1 µ
+        uint256 costExact = curve.buyCost(coinId, uint96(MICRO));
+        assertEq(costFloored, costExact, "buyCost must quantizeDown input");
+    }
+
+    /* 21. sellRefund floors non‑aligned coins via _quantizeDown */
+    function testSellRefundQuantizationDown() public {
+        uint256 coinId = _launch(1_000);
+        // mint 10 µ free tokens
+        vm.prank(userA);
+        curve.buyExactCoins{value: 0}(coinId, uint96(10 * MICRO), type(uint256).max);
+
+        // ask refund for (5 µ + 321 wei)
+        uint96 ask = uint96(5 * MICRO + 321);
+        uint256 refFloored = curve.sellRefund(coinId, ask);
+        // should equal refund for exactly 5 µ
+        uint256 refExact = curve.sellRefund(coinId, uint96(5 * MICRO));
+        assertEq(refFloored, refExact, "sellRefund must quantizeDown input");
+    }
+
+    /* 22. sellForExactEth rounds up burn amounts via _quantizeUp (steep curve) */
+    function testSellForExactEthQuantizeUp() public {
+        // ── Setup a small sale but with a steep curve so the 2nd µ‑token costs 1 wei ──
+        uint96 capTokens = uint96(100 * TOKEN); // 100 full tokens
+        uint96 cap = capTokens; // saleCap and lpSupply
+        uint256 steepDiv = 1e18; // divisor small enough that cost(2 µ) == 1 wei
+
+        // Launch with steep curve
+        (uint256 coinId,) = curve.launch(
+            0, // creatorSupply
+            0, // creatorUnlock
+            cap, // saleCap
+            cap, // lpSupply
+            100 ether, // ethTarget
+            steepDiv, // divisor
+            30, // feeOrHook (use a simple fee to keep it valid)
+            "steep-curve"
+        );
+
+        // Buy exactly 2 µ‑tokens: first is free, second costs 1 wei
+        uint96 twoMicros = uint96(2 * MICRO);
+        uint256 costForTwo = curve.buyCost(coinId, twoMicros);
+        assertEq(costForTwo, 1, "cost(2 u) must be exactly 1 wei under steepDiv=1e18");
+
+        vm.prank(userA);
+        curve.buyExactCoins{value: costForTwo}(coinId, twoMicros, type(uint256).max);
+
+        // Compute the refund for 1 µ
+        uint96 oneMicro = uint96(MICRO);
+        uint256 oneRefund = curve.sellRefund(coinId, oneMicro);
+        assertEq(oneRefund, 1, "refund(1 u) must be 1 wei");
+
+        // tokensToBurnForEth should round up to 1 µ
+        uint256 desired = oneRefund;
+        uint96 quote = curve.tokensToBurnForEth(coinId, desired);
+        assertEq(quote, oneMicro, "tokensToBurnForEth must quantizeUp to 1 u");
+
+        // Finally sellForExactEth: should burn 1 µ and refund ≥ desired
+        vm.prank(userA);
+        (uint96 burned, uint256 refundWei) = curve.sellForExactEth(coinId, desired, oneMicro);
+
+        assertEq(burned, oneMicro, "must burn exactly the quoted 1 u");
+        assertGe(refundWei, desired, "refund must cover the desired amount");
+    }
+
+    /* 23. large‐volume 1 b token sale: launch and worst‐case cost */
+    function testLargeSaleCapAndCost() public {
+        // 1 billion 18‑dec tokens → saleCap = 1e9 * 1e18 = 1e27
+        uint96 largeCap = uint96(1e9 * TOKEN);
+        // must also be ≥ 5 ETH; here 1e9 ETH ≫ 5 ETH
+        (uint256 coinId,) = curve.launch(0, 0, largeCap, largeCap, TARGET, DIV, 30, "big sale");
+
+        // query worst‑case cost to buy the full cap
+        uint256 worst = curve.buyCost(coinId, largeCap);
+        assertGt(worst, 0, "cost>0 for large saleCap");
+        // must fit within uint256/2 per launch’s safety check
+        assertLe(worst, type(uint256).max / 2, "worst case cost must satisfy safety bound");
+    }
+
     // - EXTENDED TESTS
 
     uint96 constant MIN_CAP = uint96(5 ether); // launch‑pad hard‑minimum
@@ -422,9 +560,6 @@ contract ZCurveTest is Test {
 
     uint256 constant DIV_FT_SCALED = 16_000 * 1e18; // 16 k  *  10¹⁸
 
-    /* -----------------------------------------------------------------
-    41. FT full life‑cycle: 800 M / 200 M, target 10 ETH, auto‑finalise
-    ------------------------------------------------------------------*/
     function testFriendTechFullLifecycle18Dec() public {
         uint96 saleCap = uint96(800_000_000 ether); // 8 × 10²⁶ base‑units
         uint96 lpSupply = uint96(200_000_000 ether);
