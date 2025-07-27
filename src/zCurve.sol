@@ -76,17 +76,6 @@ contract zCurve {
     event Finalize(uint256 indexed coinId, uint256 ethLp, uint256 coinLp, uint256 lpMinted);
     event Claim(address indexed user, uint256 indexed coinId, uint96 amount);
 
-    /* ───────── bitpak ───────── */
-
-    function packQuadCap(uint96 quadCap, uint96 lpUnlock) public pure returns (uint256) {
-        return uint256(quadCap) | (uint256(lpUnlock) << LP_UNLOCK_SHIFT);
-    }
-
-    function unpackQuadCap(uint256 packed) public pure returns (uint96 quadCap, uint96 lpUnlock) {
-        quadCap = uint96(packed & QUADCAP_MASK);
-        lpUnlock = uint96((packed & LP_UNLOCK_MASK) >> LP_UNLOCK_SHIFT);
-    }
-
     /* =================================================================== *
                                    LAUNCH
     * =================================================================== */
@@ -422,6 +411,7 @@ contract zCurve {
         uint256 coinAmt = S.lpSupply;
         uint256 feeOrHook = S.feeOrHook;
         address creator = S.creator;
+        uint64 deadline = S.deadline;
 
         // If fewer than two *ticks* sold, nothing has a market price.
         // Burn LP tranche and return without adding liquidity:
@@ -462,12 +452,12 @@ contract zCurve {
         if (lpUnlock == 0) {
             /* default: LP stays in zCurve contract */
             lpRecipient = address(this);
-        } else if (lpUnlock <= S.deadline) {
+        } else if (lpUnlock <= deadline) {
             /* special case: immediate transfer to creator */
-            lpRecipient = S.creator;
+            lpRecipient = creator;
         } else {
-            /* lock LP tokens in Z with specified unlock time */
-            lpRecipient = address(Z);
+            /* prep LP tokens for Z with specified unlock time */
+            lpRecipient = address(this);
         }
 
         delete sales[coinId];
@@ -486,7 +476,7 @@ contract zCurve {
         );
 
         // If LP needs to be locked in Z:
-        if (lpUnlock != 0 && lpUnlock != S.deadline) {
+        if (lpUnlock != 0 && lpUnlock > deadline) {
             uint256 poolId = _computePoolId(poolKey);
             Z.lockup(address(Z), creator, poolId, lp, lpUnlock);
         }
@@ -562,7 +552,18 @@ contract zCurve {
 
     /* ---------------- view helpers ---------------- */
 
-    // Price/Progress
+    // Bit-packing:
+
+    function packQuadCap(uint96 quadCap, uint96 lpUnlock) public pure returns (uint256) {
+        return uint256(quadCap) | (uint256(lpUnlock) << LP_UNLOCK_SHIFT);
+    }
+
+    function unpackQuadCap(uint256 packed) public pure returns (uint96 quadCap, uint96 lpUnlock) {
+        quadCap = uint96(packed & QUADCAP_MASK);
+        lpUnlock = uint96((packed & LP_UNLOCK_MASK) >> LP_UNLOCK_SHIFT);
+    }
+
+    // Price/Progress:
 
     /// @dev All the key sale parameters and live status for UI dashboards:
     function saleSummary(uint256 coinId, address user)
@@ -606,7 +607,7 @@ contract zCurve {
         quadCap = S.quadCap;
     }
 
-    // Input/Output
+    // Input/Output:
 
     function buyCost(uint256 coinId, uint96 coins) public view returns (uint256) {
         coins = _quantizeDown(coins);
