@@ -129,15 +129,15 @@ contract ZCurveTest is Test {
         assertApproxEqAbs(userA.balance, 10 ether - cost, 1 gwei);
     }
 
-    /* 3. buyForExactEth (minCoins guard) ------------------------------ */
-    function testBuyForExactEth() public {
+    /* 3. buyForExactETH (minCoins guard) ------------------------------ */
+    function testbuyForExactETH() public {
         uint256 coinId = _launch(1_000);
 
-        uint96 minCoins = curve.tokensForEth(coinId, 1 ether);
+        uint96 minCoins = curve.coinsForETH(coinId, 1 ether);
         uint256 expected = curve.buyCost(coinId, minCoins);
 
         vm.prank(userA);
-        (uint96 out, uint256 spent) = curve.buyForExactEth{value: 1 ether}(coinId, minCoins);
+        (uint96 out, uint256 spent) = curve.buyForExactETH{value: 1 ether}(coinId, minCoins);
 
         assertEq(out, minCoins);
         assertEq(spent, expected);
@@ -160,8 +160,8 @@ contract ZCurveTest is Test {
         assertEq(curve.balances(coinId, userA), uint96(80 * MICRO));
     }
 
-    /* 5. sellForExactEth (maxCoins guard) ----------------------------- */
-    function testSellForExactEth() public {
+    /* 5. sellForExactETH (maxCoins guard) ----------------------------- */
+    function testsellForExactETH() public {
         // Curve wide enough to make tokens > 0 wei within cap
         uint96 cap = 1_000; // µ‑tokens
         uint256 coinId = _launch(cap);
@@ -185,25 +185,25 @@ contract ZCurveTest is Test {
         assertGt(desired, 0, "desired must be positive");
 
         // quote how many tokens to burn for that refund
-        uint96 quote = curve.tokensToBurnForEth(coinId, desired);
+        uint96 quote = curve.coinsToBurnForETH(coinId, desired);
         assertGt(quote, 0, "quote must be positive");
 
         // execute the sell – should succeed and burn exactly `quote`
         vm.prank(owner);
-        (uint96 burned, uint256 refund) = curve.sellForExactEth(coinId, desired, quote);
+        (uint96 burned, uint256 refund) = curve.sellForExactETH(coinId, desired, quote);
 
         assertEq(burned, quote, "burned token amount mismatch");
         assertGe(refund, desired, "refund must cover desired amount");
     }
 
-    /* 6. tokensForEth view helper ------------------------------------- */
-    function testTokensForEthMatchesBuy() public {
+    /* 6. coinsForETH view helper ------------------------------------- */
+    function testcoinsForETHMatchesBuy() public {
         uint256 coinId = _launch(500);
 
-        uint96 quote = curve.tokensForEth(coinId, 0.5 ether);
+        uint96 quote = curve.coinsForETH(coinId, 0.5 ether);
 
         vm.prank(userB);
-        curve.buyForExactEth{value: 0.5 ether}(coinId, quote);
+        curve.buyForExactETH{value: 0.5 ether}(coinId, quote);
 
         assertEq(curve.balances(coinId, userB), quote);
     }
@@ -226,7 +226,7 @@ contract ZCurveTest is Test {
         );
 
         /* quote how many µ‑tokens cost very close to the target */
-        uint96 want = curve.tokensForEth(coinId, SMALL);
+        uint96 want = curve.coinsForETH(coinId, SMALL);
         uint256 cost = curve.buyCost(coinId, want);
 
         // top‑up a hair to guarantee we cross the target
@@ -288,7 +288,7 @@ contract ZCurveTest is Test {
         vm.mockCall(address(Z), abi.encodeWithSelector(IZAMM.transfer.selector), abi.encode(true));
 
         /* cross the tiny target with a paid buy */
-        uint96 want = curve.tokensForEth(coinId, SMALL);
+        uint96 want = curve.coinsForETH(coinId, SMALL);
         uint256 cost = curve.buyCost(coinId, want);
         vm.prank(userA);
         curve.buyExactCoins{value: cost + 1 wei}(coinId, want, type(uint256).max);
@@ -313,7 +313,7 @@ contract ZCurveTest is Test {
     function testCostAndQuoteForFirstTick() public {
         uint256 coinId = _launch(10);
 
-        uint96 free = curve.tokensForEth(coinId, 0);
+        uint96 free = curve.coinsForETH(coinId, 0);
         assertGt(free, 0);
         assertEq(curve.buyCost(coinId, free), 0);
     }
@@ -342,17 +342,17 @@ contract ZCurveTest is Test {
         curve.buyExactCoins{value: 0}(coinId, toBuy, type(uint256).max);
     }
 
-    /* 14. buyForExactEth refund path ---------------------------------- */
-    function testBuyForExactEthRefund() public {
+    /* 14. buyForExactETH refund path ---------------------------------- */
+    function testbuyForExactETHRefund() public {
         uint256 coinId = _launch(1_000);
 
         uint256 quoteWei = 0.3 ether;
-        uint96 minCoins = curve.tokensForEth(coinId, quoteWei);
+        uint96 minCoins = curve.coinsForETH(coinId, quoteWei);
         uint256 sendVal = quoteWei + 0.05 ether;
 
         uint256 before = userA.balance;
         vm.prank(userA);
-        (, uint256 spent) = curve.buyForExactEth{value: sendVal}(coinId, minCoins);
+        (, uint256 spent) = curve.buyForExactETH{value: sendVal}(coinId, minCoins);
         uint256 afterB = userA.balance;
 
         assertApproxEqAbs(before - afterB, spent, 1 gwei);
@@ -451,8 +451,8 @@ contract ZCurveTest is Test {
         assertEq(refFloored, refExact, "sellRefund must quantizeDown input");
     }
 
-    /* 22. sellForExactEth rounds up burn amounts via _quantizeUp (steep curve) */
-    function testSellForExactEthQuantizeUp() public {
+    /* 22. sellForExactETH rounds up burn amounts via _quantizeUp (steep curve) */
+    function testsellForExactETHQuantizeUp() public {
         // ── Setup a small sale but with a steep curve so the 2nd µ‑token costs 1 wei ──
         uint96 capTokens = uint96(100 * TOKEN); // 100 full tokens
         uint96 cap = capTokens; // saleCap and lpSupply
@@ -485,14 +485,14 @@ contract ZCurveTest is Test {
         uint256 oneRefund = curve.sellRefund(coinId, oneMicro);
         assertEq(oneRefund, 1, "refund(1 u) must be 1 wei");
 
-        // tokensToBurnForEth should round up to 1 µ
+        // coinsToBurnForETH should round up to 1 µ
         uint256 desired = oneRefund;
-        uint96 quote = curve.tokensToBurnForEth(coinId, desired);
-        assertEq(quote, oneMicro, "tokensToBurnForEth must quantizeUp to 1 u");
+        uint96 quote = curve.coinsToBurnForETH(coinId, desired);
+        assertEq(quote, oneMicro, "coinsToBurnForETH must quantizeUp to 1 u");
 
-        // Finally sellForExactEth: should burn 1 µ and refund ≥ desired
+        // Finally sellForExactETH: should burn 1 µ and refund ≥ desired
         vm.prank(userA);
-        (uint96 burned, uint256 refundWei) = curve.sellForExactEth(coinId, desired, oneMicro);
+        (uint96 burned, uint256 refundWei) = curve.sellForExactETH(coinId, desired, oneMicro);
 
         assertEq(burned, oneMicro, "must burn exactly the quoted 1 u");
         assertGe(refundWei, desired, "refund must cover the desired amount");
@@ -585,43 +585,43 @@ contract ZCurveTest is Test {
         curve.buyExactCoins{value: 0}(coinId, want, type(uint256).max);
     }
 
-    /* 26. buyForExactEth reverts after deadline (TooLate) */
-    function testBuyForExactEthRevertsAfterDeadline() public {
+    /* 26. buyForExactETH reverts after deadline (TooLate) */
+    function testbuyForExactETHRevertsAfterDeadline() public {
         uint256 coinId = _launch(10);
         // warp past the sale deadline
         vm.warp(block.timestamp + 2 weeks + 1);
         uint96 minCoins = uint96(MICRO); // non‑zero to get past the Slippage check
         vm.expectRevert(zCurve.TooLate.selector);
-        curve.buyForExactEth{value: 1 ether}(coinId, minCoins);
+        curve.buyForExactETH{value: 1 ether}(coinId, minCoins);
     }
 
-    /* 27. buyForExactEth reverts on slippage when minCoins exceeds purchasable */
-    function testBuyForExactEthSlippageReverts() public {
+    /* 27. buyForExactETH reverts on slippage when minCoins exceeds purchasable */
+    function testbuyForExactETHSlippageReverts() public {
         uint256 coinId = _launch(100);
         // quote how many µ‑tokens 1 ETH buys
-        uint96 affordable = curve.tokensForEth(coinId, 1 ether);
+        uint96 affordable = curve.coinsForETH(coinId, 1 ether);
         // ask for one quantum more than that
         uint96 minCoins = affordable + uint96(MICRO);
         vm.prank(userA);
         vm.expectRevert(zCurve.Slippage.selector);
-        curve.buyForExactEth{value: 1 ether}(coinId, minCoins);
+        curve.buyForExactETH{value: 1 ether}(coinId, minCoins);
     }
 
-    /* 28. sellForExactEth reverts if no tokens sold yet → InsufficientEscrow */
-    function testSellForExactEthInsufficientEscrowReverts() public {
+    /* 28. sellForExactETH reverts if no tokens sold yet → InsufficientEscrow */
+    function testsellForExactETHInsufficientEscrowReverts() public {
         uint256 coinId = _launch(10);
         vm.expectRevert(zCurve.InsufficientEscrow.selector);
-        curve.sellForExactEth(coinId, 1 wei, MICRO);
+        curve.sellForExactETH(coinId, 1 wei, MICRO);
     }
 
-    /* 29. sellForExactEth reverts if desiredEthOut == 0 → NoWant */
-    function testSellForExactEthNoWantReverts() public {
+    /* 29. sellForExactETH reverts if desiredEthOut == 0 → NoWant */
+    function testsellForExactETHNoWantReverts() public {
         uint256 coinId = _launch(10);
         // mint one free µ‑token so netSold > 0
         vm.prank(userA);
         curve.buyExactCoins{value: 0}(coinId, MICRO, type(uint256).max);
         vm.expectRevert(zCurve.NoWant.selector);
-        curve.sellForExactEth(coinId, 0, MICRO);
+        curve.sellForExactETH(coinId, 0, MICRO);
     }
 
     /* 30. launch accepts simple fee < MAX_FEE and rounds‑trip in saleSummary */
@@ -664,10 +664,10 @@ contract ZCurveTest is Test {
         assertFalse(fin1, "must not be finalized yet");
 
         // ── Purchase & auto‑finalize ─────────────────────────────────
-        uint96 minCoins = curve.tokensForEth(coinId, ethTargetParam);
+        uint96 minCoins = curve.coinsForETH(coinId, ethTargetParam);
         vm.prank(userA);
         (uint96 bought, uint256 spent) =
-            curve.buyForExactEth{value: ethTargetParam}(coinId, minCoins);
+            curve.buyForExactETH{value: ethTargetParam}(coinId, minCoins);
 
         // never spend more than you sent, and must buy exactly the quote
         assertLe(spent, ethTargetParam, "spent > target");
@@ -728,10 +728,10 @@ contract ZCurveTest is Test {
         assertFalse(fin1, "must not be finalized yet");
 
         // ── Purchase & auto‑finalize ─────────────────────────────────
-        uint96 minCoins = curve.tokensForEth(coinId, ethTargetParam);
+        uint96 minCoins = curve.coinsForETH(coinId, ethTargetParam);
         vm.prank(userA);
         (uint96 bought, uint256 spent) =
-            curve.buyForExactEth{value: ethTargetParam}(coinId, minCoins);
+            curve.buyForExactETH{value: ethTargetParam}(coinId, minCoins);
 
         // never spend more than you sent, and must buy exactly the quote
         assertLe(spent, ethTargetParam, "spent > target");
@@ -807,7 +807,7 @@ contract ZCurveTest is Test {
         assertEq(curve.balances(coinId, owner), 0, "claim balance wrong");
     }
 
-    function testBuyForExactEthSellsOut() public {
+    function testbuyForExactETHSellsOut() public {
         uint96 saleCap = uint96(MIN_CAP); // 5 ETH base‑units
         uint96 lpDup = saleCap;
 
@@ -828,7 +828,7 @@ contract ZCurveTest is Test {
 
         uint256 fullCost = curve.buyCost(coinId, saleCap); // tiny – <0.01 ETH
         vm.prank(userA);
-        curve.buyForExactEth{value: fullCost + 1 ether}(coinId, saleCap); // buys all, gets refund
+        curve.buyForExactETH{value: fullCost + 1 ether}(coinId, saleCap); // buys all, gets refund
 
         // Sale must be finalised (struct deleted)
         (address creator,,,,,,,,,) = curve.sales(coinId);
@@ -845,13 +845,13 @@ contract ZCurveTest is Test {
         curve.launch(0, 0, cap, cap, TARGET, badDiv, 30, cap, 2 weeks, "bad divisor");
     }
 
-    function testTokensToBurnForEthZeroEscrow() public {
+    function testcoinsToBurnForETHZeroEscrow() public {
         uint96 cap = MIN_CAP;
         // Launch with flat curve so cost(5 ETH) ≪ TARGET and no pre‑buy
         (uint256 coinId,) =
             curve.launch(0, 0, cap, cap, TARGET, DIV_FLAT, 30, cap, 2 weeks, "no escrow");
 
-        uint96 quote = curve.tokensToBurnForEth(coinId, 1 wei);
+        uint96 quote = curve.coinsToBurnForETH(coinId, 1 wei);
         assertEq(quote, 0, "quote should be 0 with empty escrow");
     }
 
@@ -886,7 +886,7 @@ contract ZCurveTest is Test {
         /* ----------------  buy & auto‑finalise  ---------------- */
         vm.deal(userA, 20 ether);
         vm.prank(userA);
-        (uint96 out, uint256 spent) = curve.buyForExactEth{value: target}(coinId, 0.001 ether);
+        (uint96 out, uint256 spent) = curve.buyForExactETH{value: target}(coinId, 0.001 ether);
 
         assertTrue(out > 1 ether, "must receive >0.001 token");
         assertLe(spent, target, "must not overspend");
@@ -990,12 +990,12 @@ contract ZCurveTest is Test {
         );
 
         // Should quote the entire saleCap when spending exactly ethTarget:
-        uint96 quote = curve.tokensForEth(coinId, ethTarget);
+        uint96 quote = curve.coinsForETH(coinId, ethTarget);
         assertEq(quote, saleCap, "must quote full saleCap");
 
         // Do the buy
         vm.prank(userA);
-        (uint96 bought, uint256 spent) = curve.buyForExactEth{value: ethTarget}(coinId, quote);
+        (uint96 bought, uint256 spent) = curve.buyForExactETH{value: ethTarget}(coinId, quote);
 
         // we got the full cap, and didn’t overspend
         assertEq(bought, saleCap, "bought != saleCap");
@@ -1107,7 +1107,7 @@ contract ZCurveTest is Test {
 
         vm.prank(userD);
         (uint96 gotRem, uint256 usedRem) =
-            curve.buyForExactEth{value: remainingEth}(coinId, coinsRem);
+            curve.buyForExactETH{value: remainingEth}(coinId, coinsRem);
 
         // we should get exactly the remainder, and not overspend
         assertEq(gotRem, coinsRem, "final tranche size");
@@ -1323,7 +1323,7 @@ contract ZCurveTest is Test {
             curve.launch(0, 0, cap, cap, TARGET, DIV, 30, packedQuadCap, 2 weeks, "keep LP");
 
         // Buy to trigger auto-finalize
-        uint96 want = curve.tokensForEth(coinId, TARGET);
+        uint96 want = curve.coinsForETH(coinId, TARGET);
         uint256 cost = curve.buyCost(coinId, want);
         vm.prank(userA);
         curve.buyExactCoins{value: cost + 1 wei}(coinId, want, type(uint256).max);
@@ -1354,7 +1354,7 @@ contract ZCurveTest is Test {
             curve.launch(0, 0, cap, cap, TARGET, DIV, 30, packedQuadCap, 2 weeks, "future LP");
 
         // Buy to trigger auto-finalize
-        uint96 want = curve.tokensForEth(coinId, TARGET);
+        uint96 want = curve.coinsForETH(coinId, TARGET);
         uint256 cost = curve.buyCost(coinId, want);
 
         // Calculate pool ID before the transaction
@@ -1507,7 +1507,7 @@ contract ZCurveTest is Test {
         // Warp to just before deadline and buy
         vm.warp(saleDeadline - 1);
 
-        uint96 want = curve.tokensForEth(coinId, TARGET);
+        uint96 want = curve.coinsForETH(coinId, TARGET);
         uint256 cost = curve.buyCost(coinId, want);
 
         PoolKey memory key = PoolKey(0, coinId, address(0), address(Z), 30);
